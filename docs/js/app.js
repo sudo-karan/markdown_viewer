@@ -286,13 +286,21 @@ async function saveToDrive() {
   try {
     if (!google.isSignedIn()) await google.signIn();
     const name = ensureMdName(state.current.name);
-    const res = state.current.driveId
-      ? await google.drive.update(state.current.driveId, state.current.text)
-      : await google.drive.create(name, state.current.text);
-    state.current.driveId = res.id;
-    if (res.name) {
-      state.current.name = res.name;
-      docTitle.value = res.name;
+    if (state.current.driveId) {
+      // update() only writes content; propagate a title change separately.
+      await google.drive.update(state.current.driveId, state.current.text);
+      if (name !== state.current.driveName) {
+        const renamed = await google.drive.rename(state.current.driveId, name);
+        state.current.name = renamed.name || name;
+        state.current.driveName = renamed.name || name;
+        docTitle.value = state.current.name;
+      }
+    } else {
+      const res = await google.drive.create(name, state.current.text);
+      state.current.driveId = res.id;
+      state.current.name = res.name || name;
+      state.current.driveName = res.name || name;
+      docTitle.value = state.current.name;
     }
     persist(state.current);
     updateStorageLoc();
@@ -348,9 +356,12 @@ async function openDriveFile(f) {
     if (existing) {
       existing.text = text;
       existing.name = f.name;
+      existing.driveName = f.name;
+      existing.updated = Date.now();
+      store.saveLibrary(state.library); // persist refreshed content immediately
       loadDoc(existing);
     } else {
-      const doc = { id: uid(), name: f.name, text, driveId: f.id, updated: Date.now() };
+      const doc = { id: uid(), name: f.name, text, driveId: f.id, driveName: f.name, updated: Date.now() };
       state.library = upsertDoc(state.library, doc);
       store.saveLibrary(state.library);
       loadDoc(doc);
@@ -363,14 +374,18 @@ async function openDriveFile(f) {
 
 function refreshGoogleUI() {
   const p = google.getProfile();
-  if (p) {
+  // Treat a valid token as "connected" even if the profile fetch failed, so the
+  // user can still reach the Drive menu / Sign out.
+  if (p || google.isSignedIn()) {
     googleBtn.classList.add("is-connected");
-    googleLabel.textContent = (p.given_name || p.name || "Account").split(" ")[0];
-    if (p.picture) {
+    googleLabel.textContent = p ? (p.given_name || p.name || "Account").split(" ")[0] : "Account";
+    if (p?.picture) {
       googleAvatar.src = p.picture;
       googleAvatar.hidden = false;
+    } else {
+      googleAvatar.hidden = true;
     }
-    googleBtn.title = `${p.email || ""} — click for Drive actions`;
+    googleBtn.title = `${p?.email || "Signed in"} — click for Drive actions`;
   } else {
     googleBtn.classList.remove("is-connected");
     googleLabel.textContent = "Sign in";
@@ -432,7 +447,7 @@ async function onGoogleButton() {
     toast("Add your Google Client ID to enable Drive.");
     return;
   }
-  if (google.getProfile()) {
+  if (google.getProfile() || google.isSignedIn()) {
     toggleGoogleMenu();
     return;
   }
@@ -671,8 +686,11 @@ function setupDivider() {
     if (!dragging) return;
     const ws = $("workspace").getBoundingClientRect();
     const sidebar = app.classList.contains("sidebar-collapsed") ? 0 : $("sidebar").offsetWidth;
-    const r = (e.clientX - ws.left - sidebar) / (ws.width - sidebar);
-    const clamped = Math.min(0.8, Math.max(0.2, r));
+    // flex-basis % is relative to the full workspace width, so the ratio must be
+    // too — otherwise the divider drifts ahead of the cursor when the sidebar
+    // is open (the default).
+    const w = e.clientX - ws.left - sidebar;
+    const clamped = Math.min(0.85, Math.max(0.15, w / ws.width));
     applyRatio(clamped);
     state.settings.splitRatio = clamped;
   });
@@ -700,11 +718,22 @@ function wireEvents() {
   editor.addEventListener("dragover", (e) => e.preventDefault());
   editor.addEventListener("drop", handleDrop);
 
-  // Tab inserts two spaces (keeps flow inside the textarea).
+  // Tab: insert two spaces at a caret; indent/outdent whole lines for a
+  // selection (Shift+Tab outdents).
   editor.addEventListener("keydown", (e) => {
     if (e.key === "Tab" && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
-      editor.setRangeText("  ", editor.selectionStart, editor.selectionEnd, "end");
+      const { selectionStart: s, selectionEnd: en, value } = editor;
+      if (s === en && !e.shiftKey) {
+        editor.setRangeText("  ", s, en, "end");
+      } else {
+        const lineStart = value.lastIndexOf("\n", s - 1) + 1;
+        const block = value.slice(lineStart, en);
+        const next = e.shiftKey
+          ? block.split("\n").map((l) => l.replace(/^ {1,2}/, "")).join("\n")
+          : block.split("\n").map((l) => "  " + l).join("\n");
+        editor.setRangeText(next, lineStart, en, "select");
+      }
       onEdit();
     }
   });
@@ -811,6 +840,10 @@ function init() {
 
   wireEvents();
   setupDivider();
+
+  // Signal the HTML fallback watchdog that the module graph loaded and the app
+  // booted (see the inline script in index.html).
+  window.__mdsReady = true;
 
   // Choose the document to show: shared link → last open → newest → sample.
   if (tryLoadShared()) return;

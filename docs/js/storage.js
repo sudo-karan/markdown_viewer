@@ -9,6 +9,33 @@ const LIB_KEY = "mds:library:v2";
 const SETTINGS_KEY = "mds:settings:v1";
 const CURRENT_KEY = "mds:current:v1";
 
+// Every localStorage access is guarded: in private mode or when storage is
+// blocked/full, reads fall back and writes no-op instead of throwing (which
+// would otherwise kill init()).
+function lsGet(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function lsSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch (e) {
+    console.warn("localStorage write failed (private mode or quota?)", e);
+    return false;
+  }
+}
+function lsRemove(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
+
 function safeParse(raw, fallback) {
   try {
     const v = JSON.parse(raw);
@@ -26,29 +53,25 @@ export function uid() {
 export const store = {
   /** @returns {Array<{id,name,text,driveId,updated}>} */
   loadLibrary() {
-    return safeParse(localStorage.getItem(LIB_KEY), []);
+    return safeParse(lsGet(LIB_KEY), []);
   },
   saveLibrary(lib) {
-    try {
-      localStorage.setItem(LIB_KEY, JSON.stringify(lib));
-    } catch (e) {
-      console.warn("Failed to persist library (quota?)", e);
-    }
+    lsSet(LIB_KEY, JSON.stringify(lib));
   },
 
   loadSettings() {
-    return safeParse(localStorage.getItem(SETTINGS_KEY), {});
+    return safeParse(lsGet(SETTINGS_KEY), {});
   },
   saveSettings(s) {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    lsSet(SETTINGS_KEY, JSON.stringify(s));
   },
 
   getCurrentId() {
-    return localStorage.getItem(CURRENT_KEY) || null;
+    return lsGet(CURRENT_KEY) || null;
   },
   setCurrentId(id) {
-    if (id) localStorage.setItem(CURRENT_KEY, id);
-    else localStorage.removeItem(CURRENT_KEY);
+    if (id) lsSet(CURRENT_KEY, id);
+    else lsRemove(CURRENT_KEY);
   },
 };
 
