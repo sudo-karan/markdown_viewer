@@ -145,11 +145,31 @@ async function authFetch(url, opts = {}, retried = false) {
   return res;
 }
 
-async function ensureFolder() {
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
+/** Turn a failed Drive response into an Error carrying Google's real message. */
+async function driveError(res, fallback) {
+  let msg = fallback;
+  try {
+    const body = await res.json();
+    if (body?.error?.message) msg = body.error.message;
+  } catch {
+    /* keep fallback */
+  }
+  const e = new Error(msg);
+  e.status = res.status;
+  return e;
+}
+
+/**
+ * Find (or create) the app's root folder — the ONLY part of Drive this app
+ * touches. Everything the app creates lives under this subtree, so with the
+ * drive.file scope the app can never see the rest of the user's Drive.
+ */
+async function ensureRootFolder() {
   if (folderId) return folderId;
-  // Find an existing app folder we created previously.
   const q = encodeURIComponent(
-    `mimeType='application/vnd.google-apps.folder' and name='${folderName.replace(/'/g, "\\'")}' and trashed=false`,
+    `mimeType='${FOLDER_MIME}' and name='${folderName.replace(/'/g, "\\'")}' and 'root' in parents and trashed=false`,
   );
   const found = await authFetch(
     `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&pageSize=1`,
@@ -164,37 +184,59 @@ async function ensureFolder() {
   const created = await authFetch("https://www.googleapis.com/drive/v3/files?fields=id", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: folderName, mimeType: "application/vnd.google-apps.folder" }),
+    body: JSON.stringify({ name: folderName, mimeType: FOLDER_MIME, parents: ["root"] }),
   });
-  if (!created.ok) throw new Error("Could not create the Drive folder.");
+  if (!created.ok) throw await driveError(created, "Could not create the Drive folder.");
   folderId = (await created.json()).id;
   return folderId;
 }
 
 export const drive = {
-  /** List Markdown files this app can see (drive.file scope). */
-  async list() {
-    const q = encodeURIComponent(
-      "trashed=false and (mimeType='text/markdown' or mimeType='text/plain' or name contains '.md' or name contains '.markdown')",
-    );
+  /** Id + display name of the app's root folder (creating it if needed). */
+  async root() {
+    const id = await ensureRootFolder();
+    return { id, name: folderName };
+  },
+
+  /**
+   * List the immediate children of a folder, split into subfolders and files,
+   * folders first. Only children the app can access (drive.file) are returned.
+   */
+  async listChildren(parentId) {
+    const id = parentId || (await ensureRootFolder());
+    const q = encodeURIComponent(`'${id}' in parents and trashed=false`);
     const res = await authFetch(
-      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=100`,
+      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType,modifiedTime)&orderBy=folder,name&pageSize=1000`,
     );
-    if (!res.ok) throw new Error("Could not list Drive files.");
-    return (await res.json()).files || [];
+    if (!res.ok) throw await driveError(res, "Could not list this folder.");
+    const items = (await res.json()).files || [];
+    return {
+      folders: items.filter((f) => f.mimeType === FOLDER_MIME),
+      files: items.filter((f) => f.mimeType !== FOLDER_MIME),
+    };
+  },
+
+  /** Create a subfolder under parentId (default: the app root). */
+  async createFolder(name, parentId) {
+    const parent = parentId || (await ensureRootFolder());
+    const res = await authFetch("https://www.googleapis.com/drive/v3/files?fields=id,name,mimeType", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parent] }),
+    });
+    if (!res.ok) throw await driveError(res, "Could not create the folder.");
+    return await res.json();
   },
 
   async read(id) {
-    const res = await authFetch(
-      `https://www.googleapis.com/drive/v3/files/${id}?alt=media`,
-    );
-    if (!res.ok) throw new Error("Could not read the Drive file.");
+    const res = await authFetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`);
+    if (!res.ok) throw await driveError(res, "Could not read the Drive file.");
     return await res.text();
   },
 
-  /** Create a new markdown file in the app folder. Returns {id,name,modifiedTime}. */
-  async create(name, text) {
-    const parent = await ensureFolder();
+  /** Create a markdown file under parentId (default: the app root). */
+  async create(name, text, parentId) {
+    const parent = parentId || (await ensureRootFolder());
     const boundary = "mds" + Math.random().toString(16).slice(2);
     const meta = { name, mimeType: "text/markdown", parents: [parent] };
     const body =
@@ -203,14 +245,14 @@ export const drive = {
       `--${boundary}\r\nContent-Type: text/markdown\r\n\r\n` +
       `${text}\r\n--${boundary}--`;
     const res = await authFetch(
-      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime",
+      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,parents",
       {
         method: "POST",
         headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
         body,
       },
     );
-    if (!res.ok) throw new Error("Could not save to Drive.");
+    if (!res.ok) throw await driveError(res, "Could not save to Drive.");
     return await res.json();
   },
 
@@ -220,21 +262,31 @@ export const drive = {
       `https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media&fields=id,name,modifiedTime`,
       { method: "PATCH", headers: { "Content-Type": "text/markdown" }, body: text },
     );
-    if (!res.ok) throw new Error("Could not update the Drive file.");
+    if (!res.ok) throw await driveError(res, "Could not update the Drive file.");
     return await res.json();
   },
 
   /** Rename an existing file. */
   async rename(id, name) {
-    const res = await authFetch(
-      `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      },
-    );
-    if (!res.ok) throw new Error("Could not rename the Drive file.");
+    const res = await authFetch(`https://www.googleapis.com/drive/v3/files/${id}?fields=id,name`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) throw await driveError(res, "Could not rename the Drive file.");
+    return await res.json();
+  },
+
+  /** Move a file into addParent (optionally out of removeParent). */
+  async move(id, addParent, removeParent) {
+    const params = new URLSearchParams({ addParents: addParent, fields: "id,parents" });
+    if (removeParent) params.set("removeParents", removeParent);
+    const res = await authFetch(`https://www.googleapis.com/drive/v3/files/${id}?${params}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) throw await driveError(res, "Could not move the file.");
     return await res.json();
   },
 };

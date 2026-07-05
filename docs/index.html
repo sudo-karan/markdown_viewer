@@ -220,19 +220,21 @@
       </div>
     </div>
 
-    <!-- Drive open -->
+    <!-- Drive folder browser -->
     <div class="modal" id="drive-modal" role="dialog" aria-modal="true" aria-labelledby="drive-title" hidden>
       <div class="modal-head">
-        <h2 id="drive-title">Open from Google Drive</h2>
+        <h2 id="drive-title">Google Drive</h2>
         <button class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
       </div>
       <div class="modal-body">
-        <div id="drive-status" class="drive-status">Loading your Markdown files…</div>
+        <nav id="drive-breadcrumb" class="drive-breadcrumb" aria-label="Folder path"></nav>
+        <div id="drive-status" class="drive-status"></div>
         <ul id="drive-list" class="drive-list"></ul>
       </div>
       <div class="modal-foot">
         <button class="ghost-btn" data-close>Cancel</button>
-        <button class="ghost-btn" id="drive-refresh">Refresh</button>
+        <button class="ghost-btn" id="drive-newfolder">New folder</button>
+        <button class="primary-btn" id="drive-savehere">Save current doc here</button>
       </div>
     </div>
 

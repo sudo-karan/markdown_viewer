@@ -14,6 +14,8 @@ window.MO_STUDIO_CONFIG = {
   // Google OAuth 2.0 Client ID (type: Web application).
   googleClientId: "",
 
-  // Name of the folder created in your Google Drive for documents saved here.
-  driveFolderName: "Markdown Studio",
+  // Name of the root folder in your Google Drive that this app manages. The app
+  // only ever sees this folder and the subfolders/files it creates inside it —
+  // never the rest of your Drive (drive.file scope).
+  driveFolderName: "markdowns",
 };
