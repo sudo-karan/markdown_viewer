@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.23.2](https://github.com/sudo-karan/markdown_viewer/commits/v0.23.2) - 2026-07-05
+### Other Changes
+- Add Markdown Studio: a static, GitHub Pages-hostable Markdown editor by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/1
+- Harden Markdown Studio: fix review-found security & correctness issues by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/3
+- Google Drive: browse folders scoped to a root "markdowns" folder by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/4
+
 ## [v0.23.2](https://github.com/k1LoW/mo/compare/v0.23.1...v0.23.2) - 2026-03-31
 ### Fix bug 🐛
 - feat: add smooth scroll for footnote references by @k1LoW in https://github.com/k1LoW/mo/pull/156
