@@ -91,6 +91,43 @@ const ALERT_TYPES = {
   CAUTION: "caution",
 };
 
+// --- Sanitizer hardening -------------------------------------------------
+// Untrusted Markdown can arrive via #s= share links and Drive files, so scrub
+// inline CSS that enables full-viewport phishing overlays or exfiltration,
+// while preserving the inline styles KaTeX and Mermaid legitimately emit (which
+// never set `position`/`z-index` or external `url()`). Also force rel=noopener
+// on any target=_blank link, including ones authored as raw HTML.
+function scrubStyle(value) {
+  return value
+    .split(";")
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .filter((decl) => {
+      const m = decl.match(/^([\w-]+)\s*:\s*([\s\S]*)$/);
+      if (!m) return false;
+      const prop = m[1].toLowerCase();
+      const val = m[2].toLowerCase();
+      if (prop === "position" && /(fixed|absolute|sticky)/.test(val)) return false;
+      if (prop === "z-index") return false;
+      if (/expression\s*\(|behavior\s*:|-moz-binding|@import/.test(val)) return false;
+      // Allow url(#fragment) (SVG gradient refs); block external/scheme url()s.
+      if (/url\s*\(\s*['"]?\s*(?!#)/.test(val)) return false;
+      return true;
+    })
+    .join("; ");
+}
+
+DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
+  if (data.attrName === "style" && data.attrValue) {
+    data.attrValue = scrubStyle(data.attrValue);
+  }
+});
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A" && node.getAttribute("target") === "_blank") {
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
 /**
  * Render Markdown source to a sanitized HTML string.
  * @param {string} text
@@ -100,9 +137,10 @@ export function renderMarkdown(text) {
   const dirty = md.render(text || "");
   return DOMPurify.sanitize(dirty, {
     USE_PROFILES: { html: true, mathMl: true, svg: true, svgFilters: true },
-    ADD_ATTR: ["target", "align", "start", "type", "checked", "disabled", "id", "class", "style"],
+    ADD_ATTR: ["target", "align", "start", "type", "checked", "disabled", "class", "style"],
     ADD_TAGS: ["details", "summary"],
-    ALLOW_DATA_ATTR: true,
+    FORBID_TAGS: ["style"],
+    ALLOW_DATA_ATTR: false,
   });
 }
 

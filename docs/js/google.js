@@ -60,30 +60,45 @@ export function getProfile() {
   return profile;
 }
 
+// The GIS token client's callback/error_callback are set once at init time and
+// cannot be refreshed per request, so they must resolve the *current* pending
+// request rather than close over one promise. We track it in `pending`.
+let pending = null;
+function onTokenResponse(resp) {
+  const p = pending;
+  pending = null;
+  if (!p) return;
+  if (resp.error) return p.reject(new Error(resp.error_description || resp.error));
+  accessToken = resp.access_token;
+  tokenExpiry = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
+  p.resolve(resp);
+}
+function onTokenError(err) {
+  const p = pending;
+  pending = null;
+  if (p) p.reject(new Error(err?.message || err?.type || "Google authorization failed."));
+}
+
 /** Acquire (or silently refresh) an access token. */
 function requestToken({ prompt } = {}) {
   return new Promise((resolve, reject) => {
     if (!clientId) return reject(new Error("Google Client ID is not set. Open Settings to add it."));
+    if (pending) return reject(new Error("A Google sign-in is already in progress."));
     if (!tokenClient) {
       tokenClient = window.google.accounts.oauth2.initTokenClient({
         client_id: clientId,
         scope: SCOPES,
-        callback: (resp) => {
-          if (resp.error) return reject(new Error(resp.error_description || resp.error));
-          accessToken = resp.access_token;
-          tokenExpiry = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
-          resolve(resp);
-        },
-        error_callback: (err) => reject(new Error(err?.message || err?.type || "Google authorization failed.")),
+        callback: onTokenResponse,
+        error_callback: onTokenError,
       });
     }
-    tokenClient.callback = (resp) => {
-      if (resp.error) return reject(new Error(resp.error_description || resp.error));
-      accessToken = resp.access_token;
-      tokenExpiry = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
-      resolve(resp);
-    };
-    tokenClient.requestAccessToken(prompt !== undefined ? { prompt } : {});
+    pending = { resolve, reject };
+    try {
+      tokenClient.requestAccessToken(prompt !== undefined ? { prompt } : {});
+    } catch (e) {
+      pending = null;
+      reject(e);
+    }
   });
 }
 
