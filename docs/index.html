@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Markdown Studio</title>
+    <meta
+      name="description"
+      content="A fast, private, browser-based Markdown editor & viewer with live preview, Mermaid, math, syntax highlighting, and Google Drive sync. Static, no backend."
+    />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+
+    <!-- Rendering styles (pinned CDN). GitHub-flavored look + math + code themes. -->
+    <link
+      id="gh-md-light"
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown-light.min.css"
+    />
+    <link
+      id="gh-md-dark"
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown-dark.min.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+    />
+    <link
+      id="hljs-light"
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/styles/github.min.css"
+    />
+    <link
+      id="hljs-dark"
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/styles/github-dark.min.css"
+    />
+
+    <link rel="stylesheet" href="./styles.css" />
+
+    <!-- Single-file highlight.js (common languages) — defines window.hljs. -->
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
+    <script src="./config.js"></script>
+  </head>
+  <body>
+    <div id="app" class="app">
+      <!-- ============================ Header ============================ -->
+      <header class="app-header">
+        <div class="brand" title="Markdown Studio">
+          <img src="./favicon.svg" alt="" width="22" height="22" />
+          <span class="brand-name">Markdown&nbsp;Studio</span>
+        </div>
+
+        <input
+          id="doc-title"
+          class="doc-title"
+          value="Untitled.md"
+          aria-label="Document name"
+          spellcheck="false"
+          autocomplete="off"
+        />
+
+        <div class="header-actions">
+          <button id="btn-new" class="icon-btn" title="New document (Ctrl/Cmd+Shift+N)" aria-label="New document">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237V14.25A1.75 1.75 0 0 1 12.25 16h-8.5A1.75 1.75 0 0 1 2 14.25Zm7 6a.75.75 0 0 0-1.5 0v1.5H6a.75.75 0 0 0 0 1.5h1.5V12a.75.75 0 0 0 1.5 0v-1.75h1.5a.75.75 0 0 0 0-1.5H9Z"/></svg>
+          </button>
+          <button id="btn-theme" class="icon-btn" title="Toggle theme" aria-label="Toggle theme">
+            <svg class="ico-moon" viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M9.598 1.591a.749.749 0 0 1 .785-.175 7.001 7.001 0 1 1-8.967 8.967.75.75 0 0 1 .961-.96 5.5 5.5 0 0 0 7.046-7.046.75.75 0 0 1 .175-.786Z"/></svg>
+            <svg class="ico-sun" viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 12a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-1.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM8 0a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V.75A.75.75 0 0 1 8 0Zm0 13a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 13Zm8-5a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 16 8ZM3 8a.75.75 0 0 1-.75.75H.75a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 3 8Zm10.657-5.657a.75.75 0 0 1 0 1.061l-1.061 1.06a.75.75 0 1 1-1.06-1.06l1.06-1.06a.75.75 0 0 1 1.06 0Zm-9.193 9.193a.75.75 0 0 1 0 1.06l-1.06 1.061a.75.75 0 1 1-1.061-1.06l1.06-1.061a.75.75 0 0 1 1.061 0Zm9.193 2.121a.75.75 0 0 1-1.06 0l-1.061-1.06a.75.75 0 1 1 1.06-1.061l1.061 1.06a.75.75 0 0 1 0 1.061ZM4.464 4.464a.75.75 0 0 1-1.06 0L2.343 3.404a.75.75 0 0 1 1.06-1.06l1.061 1.06a.75.75 0 0 1 0 1.06Z"/></svg>
+          </button>
+          <button id="btn-help" class="icon-btn" title="Keyboard shortcuts & help" aria-label="Help">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM6.92 6.085c.081-.16.19-.299.34-.398.145-.097.371-.187.74-.187.28 0 .553.087.738.225A.613.613 0 0 1 9 6.25c0 .177-.04.264-.077.318a.956.956 0 0 1-.277.245c-.076.051-.158.1-.258.161l-.007.004c-.093.056-.204.122-.313.195a2.416 2.416 0 0 0-.756.749A.75.75 0 0 0 8 9.078c.34 0 .544-.22.673-.376.06-.072.144-.147.336-.279l.146-.088c.093-.056.199-.12.302-.191.21-.144.427-.325.588-.581.164-.261.257-.56.257-.913 0-.552-.243-1.02-.629-1.301A2.352 2.352 0 0 0 8 4.75c-.593 0-1.107.15-1.522.42-.418.271-.72.638-.911 1.014a.75.75 0 1 0 1.354.66ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"/></svg>
+          </button>
+          <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M8 0a1.75 1.75 0 0 1 1.732 1.475l.09.549a5.71 5.71 0 0 1 .917.383l.454-.32a1.75 1.75 0 0 1 2.284.182l.354.353a1.75 1.75 0 0 1 .182 2.285l-.32.454c.153.293.282.6.383.917l.549.09A1.75 1.75 0 0 1 16 8a1.75 1.75 0 0 1-1.475 1.732l-.549.09a5.71 5.71 0 0 1-.383.917l.32.454a1.75 1.75 0 0 1-.182 2.284l-.353.354a1.75 1.75 0 0 1-2.285.182l-.454-.32a5.71 5.71 0 0 1-.917.383l-.09.549A1.75 1.75 0 0 1 8 16a1.75 1.75 0 0 1-1.732-1.475l-.09-.549a5.71 5.71 0 0 1-.917-.383l-.454.32a1.75 1.75 0 0 1-2.284-.182l-.354-.353a1.75 1.75 0 0 1-.182-2.285l.32-.454a5.71 5.71 0 0 1-.383-.917l-.549-.09A1.75 1.75 0 0 1 0 8a1.75 1.75 0 0 1 1.475-1.732l.549-.09c.101-.317.23-.624.383-.917l-.32-.454a1.75 1.75 0 0 1 .182-2.284l.353-.354a1.75 1.75 0 0 1 2.285-.182l.454.32c.293-.153.6-.282.917-.383l.09-.549A1.75 1.75 0 0 1 8 0Zm0 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/></svg>
+          </button>
+          <button id="btn-google" class="google-btn" title="Sign in with Google to sync to Drive">
+            <svg viewBox="0 0 18 18" width="16" height="16"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615Z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.583-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18Z"/><path fill="#FBBC05" d="M3.964 10.706A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.706V4.962H.957A8.997 8.997 0 0 0 0 9c0 1.452.348 2.827.957 4.038l3.007-2.332Z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.962L3.964 7.294C4.672 5.166 6.656 3.58 9 3.58Z"/></svg>
+            <span id="google-btn-label">Sign in</span>
+            <img id="google-avatar" class="google-avatar" alt="" hidden />
+          </button>
+        </div>
+      </header>
+
+      <!-- ============================ Toolbar ============================ -->
+      <div class="toolbar" role="toolbar" aria-label="Editor toolbar">
+        <div class="toolbar-group">
+          <button class="icon-btn" data-fmt="bold" title="Bold (Ctrl/Cmd+B)"><b>B</b></button>
+          <button class="icon-btn" data-fmt="italic" title="Italic (Ctrl/Cmd+I)"><i>I</i></button>
+          <button class="icon-btn" data-fmt="strike" title="Strikethrough"><s>S</s></button>
+          <button class="icon-btn mono" data-fmt="code" title="Inline code">&lt;/&gt;</button>
+        </div>
+        <span class="toolbar-sep"></span>
+        <div class="toolbar-group">
+          <button class="icon-btn" data-fmt="h1" title="Heading 1">H1</button>
+          <button class="icon-btn" data-fmt="h2" title="Heading 2">H2</button>
+          <button class="icon-btn" data-fmt="quote" title="Blockquote">&ldquo;</button>
+          <button class="icon-btn" data-fmt="ul" title="Bullet list">&bull;</button>
+          <button class="icon-btn" data-fmt="ol" title="Numbered list">1.</button>
+          <button class="icon-btn" data-fmt="task" title="Task list">&#9744;</button>
+        </div>
+        <span class="toolbar-sep"></span>
+        <div class="toolbar-group">
+          <button class="icon-btn" data-fmt="link" title="Link (Ctrl/Cmd+K)">&#128279;</button>
+          <button class="icon-btn" data-fmt="image" title="Insert image">&#128247;</button>
+          <button class="icon-btn" data-fmt="table" title="Insert table">&#8862;</button>
+          <button class="icon-btn" data-fmt="codeblock" title="Code block">{ }</button>
+          <button class="icon-btn" data-fmt="hr" title="Horizontal rule">&#8213;</button>
+        </div>
+
+        <div class="toolbar-spacer"></div>
+
+        <div class="toolbar-group view-modes" role="group" aria-label="View mode">
+          <button class="mode-btn" data-view="edit" title="Editor only">Edit</button>
+          <button class="mode-btn is-active" data-view="split" title="Split view">Split</button>
+          <button class="mode-btn" data-view="preview" title="Preview only">Preview</button>
+        </div>
+      </div>
+
+      <!-- ============================ Workspace ============================ -->
+      <div class="workspace" id="workspace">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+          <div class="sidebar-tabs" role="tablist">
+            <button class="side-tab is-active" data-tab="library" role="tab">Library</button>
+            <button class="side-tab" data-tab="outline" role="tab">Outline</button>
+          </div>
+
+          <div class="side-panel" data-panel="library">
+            <div class="side-actions">
+              <button id="btn-open-local" class="ghost-btn" title="Open a file from your computer">Open file…</button>
+              <button id="btn-open-drive" class="ghost-btn" title="Open a document from Google Drive">Drive…</button>
+            </div>
+            <ul id="library-list" class="library-list"></ul>
+          </div>
+
+          <div class="side-panel" data-panel="outline" hidden>
+            <nav id="outline" class="outline" aria-label="Document outline"></nav>
+          </div>
+        </aside>
+
+        <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25H5v-13Zm4.75 13h7.75a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25H6.5Z"/></svg>
+        </button>
+
+        <!-- Editor -->
+        <section class="pane editor-pane" id="editor-pane">
+          <textarea
+            id="editor"
+            class="editor"
+            spellcheck="true"
+            autocomplete="off"
+            autocapitalize="off"
+            placeholder="# Start writing…&#10;&#10;Type Markdown here — it renders live on the right."
+          ></textarea>
+        </section>
+
+        <div class="pane-divider" id="pane-divider" title="Drag to resize"></div>
+
+        <!-- Preview -->
+        <section class="pane preview-pane" id="preview-pane">
+          <article id="preview" class="markdown-body"></article>
+        </section>
+      </div>
+
+      <!-- ============================ Status bar ============================ -->
+      <footer class="statusbar">
+        <div class="status-left">
+          <span id="save-state" class="save-state" data-state="saved">Saved</span>
+          <span class="status-dot">&middot;</span>
+          <span id="storage-loc" class="storage-loc">Local</span>
+        </div>
+        <div class="status-right">
+          <button id="btn-share" class="link-btn" title="Copy a shareable link (content encoded in the URL)">Share link</button>
+          <button id="btn-export" class="link-btn" title="Export / download">Export</button>
+          <span class="status-dot">&middot;</span>
+          <span id="stat-words">0 words</span>
+          <span id="stat-read">0 min read</span>
+          <span id="cursor-pos">Ln 1, Col 1</span>
+        </div>
+      </footer>
+    </div>
+
+    <!-- ============================ Modals ============================ -->
+    <div class="modal-backdrop" id="modal-backdrop" hidden></div>
+
+    <!-- Settings -->
+    <div class="modal" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+      <div class="modal-head">
+        <h2 id="settings-title">Settings</h2>
+        <button class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span class="field-label">Google OAuth Client ID</span>
+          <input id="set-client-id" class="text-input" placeholder="1234567890-abc123.apps.googleusercontent.com" spellcheck="false" />
+          <span class="field-hint">
+            Needed only for Google Drive sync. A Client ID is public and safe to share.
+            <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Create one →</a>
+            See the README for the 2-minute setup.
+          </span>
+        </label>
+
+        <div class="settings-privacy">
+          <strong>Privacy:</strong> This app has no backend. Documents live in your browser
+          (localStorage) and, if you connect Google, in your own Google Drive using the
+          least-privilege <code>drive.file</code> scope (the app only sees files it creates or
+          that you open with it). Nothing is sent to any third-party server.
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="ghost-btn" data-close>Close</button>
+        <button class="primary-btn" id="set-save">Save settings</button>
+      </div>
+    </div>
+
+    <!-- Drive open -->
+    <div class="modal" id="drive-modal" role="dialog" aria-modal="true" aria-labelledby="drive-title" hidden>
+      <div class="modal-head">
+        <h2 id="drive-title">Open from Google Drive</h2>
+        <button class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="drive-status" class="drive-status">Loading your Markdown files…</div>
+        <ul id="drive-list" class="drive-list"></ul>
+      </div>
+      <div class="modal-foot">
+        <button class="ghost-btn" data-close>Cancel</button>
+        <button class="ghost-btn" id="drive-refresh">Refresh</button>
+      </div>
+    </div>
+
+    <!-- Export -->
+    <div class="modal" id="export-modal" role="dialog" aria-modal="true" aria-labelledby="export-title" hidden>
+      <div class="modal-head">
+        <h2 id="export-title">Export</h2>
+        <button class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body export-grid">
+        <button class="export-opt" data-export="md"><strong>Markdown</strong><span>Download the .md source</span></button>
+        <button class="export-opt" data-export="html"><strong>Standalone HTML</strong><span>Self-contained styled page</span></button>
+        <button class="export-opt" data-export="copy-html"><strong>Copy HTML</strong><span>Rendered HTML to clipboard</span></button>
+        <button class="export-opt" data-export="print"><strong>Print / PDF</strong><span>Open the print dialog</span></button>
+      </div>
+    </div>
+
+    <!-- Help -->
+    <div class="modal" id="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+      <div class="modal-head">
+        <h2 id="help-title">Markdown Studio</h2>
+        <button class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="help-lede">A private, offline-friendly Markdown editor that runs entirely in your browser — no server, no tracking.</p>
+        <h3>Shortcuts</h3>
+        <table class="shortcut-table">
+          <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>S</kbd></td><td>Save (Drive if connected, else local)</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd></td><td>Save a copy to Google Drive</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>Shift</kbd> + <kbd>N</kbd></td><td>New document</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>B</kbd> / <kbd>I</kbd> / <kbd>K</kbd></td><td>Bold / Italic / Link</td></tr>
+          <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd></td><td>Edit / Split / Preview view</td></tr>
+          <tr><td><kbd>Tab</kbd> in a list</td><td>Continues the list / indents</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Close dialogs</td></tr>
+        </table>
+        <h3>Features</h3>
+        <ul class="feature-list">
+          <li>GitHub-flavored Markdown: tables, task lists, footnotes, alerts (<code>&gt; [!NOTE]</code>)</li>
+          <li>Syntax highlighting, Mermaid diagrams, and KaTeX math (<code>$…$</code>, <code>$$…$$</code>)</li>
+          <li>Live split preview with synced scrolling and a clickable outline</li>
+          <li>Local-first: autosaves to your browser; open/save files from disk</li>
+          <li>Google Drive sync and an optional activity log to your own Sheet</li>
+          <li>Paste an image to embed it, and share a doc as a self-contained link</li>
+        </ul>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>
