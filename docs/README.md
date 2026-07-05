@@ -18,7 +18,9 @@ Google Drive sync.
 - **Local-first** — every document autosaves to your browser. Open files from
   disk, drag-and-drop, or paste an image to embed it as a data URI.
 - **Google Drive sync** (optional) — sign in with Google and save/open documents
-  in your own Drive.
+  in your own Drive, organized into **folders**. The app browses a single root
+  folder (`markdowns` by default) and the subfolders you create inside it — and,
+  by design, can see *nothing else* in your Drive.
 - **Export & share** — download `.md` or a self-contained `.html`, copy rendered
   HTML, print to PDF, or copy a link that encodes the whole document in the URL.
 - **Themes** — GitHub light/dark, following your system preference.
@@ -64,6 +66,26 @@ share — it is *not* a secret):
 > The app requests the least-privilege **`drive.file`** scope: it can only see
 > and manage files it creates or that you explicitly open with it — never your
 > whole Drive.
+
+Also enable the **Google Drive API** for the project (APIs & Services →
+Library → "Google Drive API" → Enable), otherwise Drive calls fail with a 403.
+
+### Folders
+
+Open **Drive…** to browse a root folder named **`markdowns`** (created on first
+use; change the name in [`config.js`](./config.js) → `driveFolderName`). Inside
+it you can:
+
+- navigate subfolders via the breadcrumb,
+- create subfolders with **New folder**, and
+- place the current document into the folder you're viewing with **Save current
+  doc here** (this also *moves* a document that's already in Drive).
+
+Because the scope is `drive.file`, the app only ever sees this `markdowns`
+subtree — specifically, the folders and files **it** creates or that you open
+through it. Files you add to `markdowns` manually from the Drive website won't
+appear here (that would require a broader, Google-verified scope, which this app
+intentionally avoids).
 
 ## Security & privacy
 

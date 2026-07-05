@@ -61,16 +61,22 @@ flowchart LR
 Happy writing! Press **Ctrl/Cmd + /** any time for shortcuts.
 `;
 
+const FOLDER_ICON =
+  '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"></path></svg>';
+const FILE_ICON =
+  '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237V14.25A1.75 1.75 0 0 1 12.25 16h-8.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 8 4.25V1.5Z"></path></svg>';
+
 /* ------------------------------------------------------------------ state */
 const state = {
   settings: {},
   library: [],
-  current: null, // {id,name,text,driveId,updated}
+  current: null, // {id,name,text,driveId,driveName,driveParentId,updated}
   view: "split",
   dark: true,
   renderTimer: 0,
   saveTimer: 0,
   syncingScroll: false,
+  drive: { stack: [] }, // breadcrumb of {id,name} for the Drive browser
 };
 
 /* ------------------------------------------------------------------ dom */
@@ -276,7 +282,10 @@ function ensureMdName(name) {
   return /\.(md|markdown|txt|mmd)$/i.test(name) ? name : name.replace(/\s+$/, "") + ".md";
 }
 
-async function saveToDrive() {
+// Save the current doc to Drive. targetFolderId (optional) places a NEW file in,
+// or MOVES an existing file to, that folder; omitted → keep current location
+// (root for new files).
+async function saveToDrive(targetFolderId) {
   if (!google.isConfigured()) {
     toast("Add your Google Client ID in Settings to enable Drive.", "error");
     openModal("settings-modal");
@@ -287,7 +296,7 @@ async function saveToDrive() {
     if (!google.isSignedIn()) await google.signIn();
     const name = ensureMdName(state.current.name);
     if (state.current.driveId) {
-      // update() only writes content; propagate a title change separately.
+      // update() only writes content; title/location changes go separately.
       await google.drive.update(state.current.driveId, state.current.text);
       if (name !== state.current.driveName) {
         const renamed = await google.drive.rename(state.current.driveId, name);
@@ -295,9 +304,14 @@ async function saveToDrive() {
         state.current.driveName = renamed.name || name;
         docTitle.value = state.current.name;
       }
+      if (targetFolderId && targetFolderId !== state.current.driveParentId) {
+        await google.drive.move(state.current.driveId, targetFolderId, state.current.driveParentId);
+        state.current.driveParentId = targetFolderId;
+      }
     } else {
-      const res = await google.drive.create(name, state.current.text);
+      const res = await google.drive.create(name, state.current.text, targetFolderId);
       state.current.driveId = res.id;
+      state.current.driveParentId = (res.parents && res.parents[0]) || targetFolderId || null;
       state.current.name = res.name || name;
       state.current.driveName = res.name || name;
       docTitle.value = state.current.name;
@@ -312,42 +326,111 @@ async function saveToDrive() {
   }
 }
 
-async function openDrivePicker() {
+// ---- Drive folder browser (scoped to the app's root folder) ----
+function currentDriveFolder() {
+  return state.drive.stack[state.drive.stack.length - 1];
+}
+function showDriveStatus(msg) {
+  $("drive-status").textContent = msg || "";
+}
+
+async function openDriveBrowser() {
   if (!google.isConfigured()) {
     toast("Add your Google Client ID in Settings first.", "error");
     openModal("settings-modal");
     return;
   }
   openModal("drive-modal");
-  const status = $("drive-status");
-  const list = $("drive-list");
-  list.innerHTML = "";
-  status.hidden = false;
-  status.textContent = "Loading your Markdown files…";
+  $("drive-breadcrumb").innerHTML = "";
+  $("drive-list").innerHTML = "";
+  showDriveStatus("Connecting to Google Drive…");
   try {
     if (!google.isSignedIn()) await google.signIn();
     refreshGoogleUI();
-    const files = await google.drive.list();
-    status.hidden = files.length > 0;
-    if (files.length === 0) {
-      status.textContent = "No Markdown files this app can access yet. Save one to Drive first.";
-      return;
-    }
-    for (const f of files) {
-      const li = document.createElement("li");
-      li.className = "drive-item";
-      const when = f.modifiedTime ? new Date(f.modifiedTime).toLocaleString() : "";
-      li.innerHTML = `<span class="d-name">${escapeHtml(f.name)}</span><span class="d-time">${when}</span>`;
-      li.addEventListener("click", () => openDriveFile(f));
-      list.appendChild(li);
-    }
+    state.drive.stack = [await google.drive.root()];
+    await renderDriveFolder();
   } catch (e) {
-    status.hidden = false;
-    status.textContent = e.message || "Could not reach Google Drive.";
+    showDriveStatus(e.message || "Could not reach Google Drive.");
   }
 }
 
-async function openDriveFile(f) {
+function renderBreadcrumb() {
+  const bc = $("drive-breadcrumb");
+  bc.innerHTML = "";
+  state.drive.stack.forEach((folder, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "drive-crumb-sep";
+      sep.textContent = "›";
+      bc.appendChild(sep);
+    }
+    const b = document.createElement("button");
+    b.className = "drive-crumb";
+    b.textContent = folder.name;
+    b.addEventListener("click", () => {
+      if (i === state.drive.stack.length - 1) return;
+      state.drive.stack = state.drive.stack.slice(0, i + 1);
+      renderDriveFolder();
+    });
+    bc.appendChild(b);
+  });
+}
+
+async function renderDriveFolder() {
+  renderBreadcrumb();
+  const list = $("drive-list");
+  list.innerHTML = "";
+  showDriveStatus("Loading…");
+  const folder = currentDriveFolder();
+  try {
+    const { folders, files } = await google.drive.listChildren(folder.id);
+    if (folders.length === 0 && files.length === 0) {
+      showDriveStatus('This folder is empty. Use "New folder" or "Save current doc here".');
+      return;
+    }
+    showDriveStatus("");
+    for (const f of folders) {
+      const li = document.createElement("li");
+      li.className = "drive-item folder";
+      li.innerHTML = `<span class="di-icon">${FOLDER_ICON}</span><span class="d-name">${escapeHtml(f.name)}</span><span class="d-chevron">›</span>`;
+      li.addEventListener("click", () => {
+        state.drive.stack.push({ id: f.id, name: f.name });
+        renderDriveFolder();
+      });
+      list.appendChild(li);
+    }
+    for (const f of files) {
+      const li = document.createElement("li");
+      li.className = "drive-item file";
+      const when = f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : "";
+      li.innerHTML = `<span class="di-icon">${FILE_ICON}</span><span class="d-name">${escapeHtml(f.name)}</span><span class="d-time">${when}</span>`;
+      li.addEventListener("click", () => openDriveFile(f, folder.id));
+      list.appendChild(li);
+    }
+  } catch (e) {
+    showDriveStatus(e.message || "Could not list this folder.");
+  }
+}
+
+async function driveNewFolder() {
+  const name = prompt("New folder name:");
+  if (!name || !name.trim()) return;
+  try {
+    await google.drive.createFolder(name.trim(), currentDriveFolder().id);
+    await renderDriveFolder();
+    toast("Folder created", "success");
+  } catch (e) {
+    toast(e.message || "Could not create folder", "error");
+  }
+}
+
+async function driveSaveHere() {
+  const folder = currentDriveFolder();
+  await saveToDrive(folder.id);
+  if (state.current.driveId) closeModals();
+}
+
+async function openDriveFile(f, parentId) {
   try {
     const text = await google.drive.read(f.id);
     closeModals();
@@ -357,11 +440,20 @@ async function openDriveFile(f) {
       existing.text = text;
       existing.name = f.name;
       existing.driveName = f.name;
+      existing.driveParentId = parentId || existing.driveParentId || null;
       existing.updated = Date.now();
       store.saveLibrary(state.library); // persist refreshed content immediately
       loadDoc(existing);
     } else {
-      const doc = { id: uid(), name: f.name, text, driveId: f.id, driveName: f.name, updated: Date.now() };
+      const doc = {
+        id: uid(),
+        name: f.name,
+        text,
+        driveId: f.id,
+        driveName: f.name,
+        driveParentId: parentId || null,
+        updated: Date.now(),
+      };
       state.library = upsertDoc(state.library, doc);
       store.saveLibrary(state.library);
       loadDoc(doc);
@@ -413,7 +505,7 @@ function toggleGoogleMenu() {
   menuEl.style.left = Math.max(8, rect.right - 200) + "px";
   const actions = [
     ["Save to Drive", saveToDrive],
-    ["Open from Drive", openDrivePicker],
+    ["Open from Drive", openDriveBrowser],
     ["Sign out", doSignOut],
   ];
   for (const [label, fn] of actions) {
@@ -758,12 +850,13 @@ function wireEvents() {
   $("btn-help").addEventListener("click", () => openModal("help-modal"));
   $("btn-settings").addEventListener("click", () => openModal("settings-modal"));
   $("btn-open-local").addEventListener("click", openLocalFile);
-  $("btn-open-drive").addEventListener("click", openDrivePicker);
+  $("btn-open-drive").addEventListener("click", openDriveBrowser);
   $("btn-share").addEventListener("click", shareLink);
   $("btn-export").addEventListener("click", () => openModal("export-modal"));
   $("btn-google").addEventListener("click", onGoogleButton);
   $("set-save").addEventListener("click", saveSettings);
-  $("drive-refresh").addEventListener("click", openDrivePicker);
+  $("drive-newfolder").addEventListener("click", driveNewFolder);
+  $("drive-savehere").addEventListener("click", driveSaveHere);
 
   document.querySelectorAll("[data-export]").forEach((b) =>
     b.addEventListener("click", () => doExport(b.dataset.export)),
