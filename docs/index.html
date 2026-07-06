@@ -134,10 +134,11 @@
 
           <div class="side-panel" data-panel="library">
             <div class="side-actions">
-              <button id="btn-open-local" class="ghost-btn" title="Open a file from your computer">Open file…</button>
-              <button id="btn-open-drive" class="ghost-btn" title="Open a document from Google Drive">Drive…</button>
+              <button id="btn-open-local" class="ghost-btn" title="Import a file from your computer">Import…</button>
+              <button id="btn-new-file" class="ghost-btn" title="New document">New file</button>
+              <button id="btn-new-folder" class="ghost-btn" title="New folder">New folder</button>
             </div>
-            <ul id="library-list" class="library-list"></ul>
+            <div id="tree" class="tree" role="tree"></div>
           </div>
 
           <div class="side-panel" data-panel="outline" hidden>
@@ -217,24 +218,6 @@
       <div class="modal-foot">
         <button class="ghost-btn" data-close>Close</button>
         <button class="primary-btn" id="set-save">Save settings</button>
-      </div>
-    </div>
-
-    <!-- Drive folder browser -->
-    <div class="modal" id="drive-modal" role="dialog" aria-modal="true" aria-labelledby="drive-title" hidden>
-      <div class="modal-head">
-        <h2 id="drive-title">Google Drive</h2>
-        <button class="icon-btn modal-close" data-close aria-label="Close">&times;</button>
-      </div>
-      <div class="modal-body">
-        <nav id="drive-breadcrumb" class="drive-breadcrumb" aria-label="Folder path"></nav>
-        <div id="drive-status" class="drive-status"></div>
-        <ul id="drive-list" class="drive-list"></ul>
-      </div>
-      <div class="modal-foot">
-        <button class="ghost-btn" data-close>Cancel</button>
-        <button class="ghost-btn" id="drive-newfolder">New folder</button>
-        <button class="primary-btn" id="drive-savehere">Save current doc here</button>
       </div>
     </div>
 
