@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.23.3](https://github.com/sudo-karan/markdown_viewer/compare/v0.23.2...v0.23.3) - 2026-07-06
+### Other Changes
+- Unified local + Drive folder-tree sidebar with in-place save/rename by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/5
+
 ## [v0.23.2](https://github.com/sudo-karan/markdown_viewer/commits/v0.23.2) - 2026-07-05
 ### Other Changes
 - Add Markdown Studio: a static, GitHub Pages-hostable Markdown editor by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/1
