@@ -277,6 +277,17 @@ export const drive = {
     return await res.json();
   },
 
+  /** Move a file/folder to the Drive trash. */
+  async trash(id) {
+    const res = await authFetch(`https://www.googleapis.com/drive/v3/files/${id}?fields=id`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trashed: true }),
+    });
+    if (!res.ok) throw await driveError(res, "Could not delete from Drive.");
+    return await res.json();
+  },
+
   /** Move a file into addParent (optionally out of removeParent). */
   async move(id, addParent, removeParent) {
     const params = new URLSearchParams({ addParents: addParent, fields: "id,parents" });

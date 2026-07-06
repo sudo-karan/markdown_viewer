@@ -65,6 +65,10 @@ const FOLDER_ICON =
   '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"></path></svg>';
 const FILE_ICON =
   '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237V14.25A1.75 1.75 0 0 1 12.25 16h-8.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 8 4.25V1.5Z"></path></svg>';
+const DEVICE_ICON =
+  '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 14.25 12h-3.5l.5 2h1a.75.75 0 0 1 0 1.5H3.75a.75.75 0 0 1 0-1.5h1l.5-2h-3.5A1.75 1.75 0 0 1 0 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>';
+const CLOUD_ICON =
+  '<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M4.5 13a4 4 0 0 1-.5-7.97A4.5 4.5 0 0 1 13 6.5a3.5 3.5 0 0 1-.5 6.96V13H4.5Z"></path></svg>';
 
 /* ------------------------------------------------------------------ state */
 const state = {
@@ -76,7 +80,8 @@ const state = {
   renderTimer: 0,
   saveTimer: 0,
   syncingScroll: false,
-  drive: { stack: [] }, // breadcrumb of {id,name} for the Drive browser
+  driveRootId: null, // id of the "markdowns" root folder, once loaded
+  driveCache: {}, // folderId -> {name,folders:[{id,name}],files:[{id,name,modifiedTime}],loaded,loading,error}
 };
 
 /* ------------------------------------------------------------------ dom */
@@ -87,7 +92,7 @@ const preview = $("preview");
 const docTitle = $("doc-title");
 const saveState = $("save-state");
 const storageLoc = $("storage-loc");
-const libraryList = $("library-list");
+const treeEl = $("tree");
 const outlineEl = $("outline");
 const toastEl = $("toast");
 const googleBtn = $("btn-google");
@@ -196,12 +201,12 @@ function updateStorageLoc() {
 }
 
 /* ------------------------------------------------------------------ documents */
-function persist(doc, { markSaved = true } = {}) {
+function persist(doc, { markSaved = true, rerender = true } = {}) {
   doc.updated = Date.now();
   state.library = upsertDoc(state.library, doc);
   store.saveLibrary(state.library);
   store.setCurrentId(doc.id);
-  renderLibrary();
+  if (rerender) renderTree();
   if (markSaved) setSaveState("saved");
 }
 
@@ -214,41 +219,602 @@ function loadDoc(doc) {
   updateStats();
   updateCursor();
   renderNow();
-  renderLibrary();
+  renderTree();
   setSaveState("saved");
   editor.scrollTop = 0;
 }
 
-function newDoc(name = "Untitled.md", text = "") {
-  const doc = { id: uid(), name, text, driveId: null, updated: Date.now() };
+function newDoc(name = "Untitled.md", text = "", folder = "") {
+  const doc = { id: uid(), name, text, driveId: null, folder, updated: Date.now() };
   state.library = upsertDoc(state.library, doc);
   store.saveLibrary(state.library);
   loadDoc(doc);
   return doc;
 }
 
-function renderLibrary() {
-  libraryList.innerHTML = "";
-  if (state.library.length === 0) {
-    libraryList.innerHTML = `<li style="color:var(--text-muted);font-size:12px;padding:8px">No documents yet.</li>`;
+/* ============================ Unified file tree ============================
+ * One sidebar tree over two sources: local docs (organized into virtual
+ * folders via doc.folder) and the Google Drive "markdowns" subtree (lazy).
+ * Every structural op writes straight back to its source.
+ * ======================================================================== */
+const LOCAL_ROOT_KEY = "ROOT:local";
+const DRIVE_ROOT_KEY = "ROOT:drive";
+const TWISTY_SVG = '<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor"><path d="M6 4l4 4-4 4z"></path></svg>';
+
+function expandedMap() {
+  return state.settings.expanded || (state.settings.expanded = {});
+}
+function isExpanded(key) {
+  return expandedMap()[key] === true;
+}
+function setExpanded(key, on) {
+  if (on) expandedMap()[key] = true;
+  else delete expandedMap()[key];
+  store.saveSettings(state.settings);
+}
+function toggleExpand(key) {
+  setExpanded(key, !isExpanded(key));
+  renderTree();
+}
+function localFolders() {
+  return state.settings.localFolders || (state.settings.localFolders = []);
+}
+
+/* ---- context menu ---- */
+let ctxEl = null;
+function closeContextMenu() {
+  ctxEl?.remove();
+  ctxEl = null;
+  document.removeEventListener("click", onCtxOutside, true);
+}
+function onCtxOutside(e) {
+  if (ctxEl && !ctxEl.contains(e.target)) closeContextMenu();
+}
+function openContextMenu(x, y, items) {
+  closeContextMenu();
+  ctxEl = document.createElement("div");
+  ctxEl.className = "ctx-menu";
+  for (const [label, fn, danger] of items) {
+    const b = document.createElement("button");
+    if (danger) b.className = "danger";
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      closeContextMenu();
+      fn();
+    });
+    ctxEl.appendChild(b);
+  }
+  ctxEl.style.left = Math.min(x, window.innerWidth - 170) + "px";
+  ctxEl.style.top = Math.min(y, window.innerHeight - 40 - items.length * 30) + "px";
+  document.body.appendChild(ctxEl);
+  setTimeout(() => document.addEventListener("click", onCtxOutside, true), 0);
+}
+
+/* ---- one tree row ---- */
+function makeRow(o) {
+  const row = document.createElement("div");
+  row.className = "tree-row " + (o.cls || "");
+  if (o.active) row.classList.add("is-active");
+  if (o.expandedFlag) row.classList.add("expanded");
+  row.style.paddingLeft = 6 + o.depth * 13 + "px";
+  row.setAttribute("role", "treeitem");
+
+  const tw = document.createElement("span");
+  tw.className = "tree-twisty" + (o.twisty ? "" : " spacer");
+  if (o.twisty) tw.innerHTML = TWISTY_SVG;
+  row.appendChild(tw);
+
+  const ic = document.createElement("span");
+  ic.className = "tree-icon";
+  ic.innerHTML = o.icon;
+  row.appendChild(ic);
+
+  const lb = document.createElement("span");
+  lb.className = "tree-label";
+  lb.textContent = o.name;
+  lb.title = o.name;
+  row.appendChild(lb);
+
+  if (o.badge) {
+    const bd = document.createElement("span");
+    bd.className = "tree-badge";
+    bd.textContent = o.badge;
+    row.appendChild(bd);
+  }
+
+  if (o.menu) {
+    const kb = document.createElement("button");
+    kb.className = "tree-kebab";
+    kb.title = "Actions";
+    kb.textContent = "⋯";
+    kb.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const r = kb.getBoundingClientRect();
+      openContextMenu(r.left, r.bottom + 2, o.menu());
+    });
+    row.appendChild(kb);
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openContextMenu(e.clientX, e.clientY, o.menu());
+    });
+  }
+
+  row.addEventListener("click", (e) => {
+    if (e.target.closest(".tree-kebab")) return;
+    if (o.onActivate) o.onActivate();
+    else if (o.onToggle) o.onToggle();
+  });
+
+  if (o.dragData) {
+    row.draggable = true;
+    row.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("text/plain", JSON.stringify(o.dragData));
+      e.dataTransfer.effectAllowed = "move";
+    });
+  }
+  if (o.onDrop) {
+    row.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      row.classList.add("drop-target");
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+    row.addEventListener("drop", (e) => {
+      e.preventDefault();
+      row.classList.remove("drop-target");
+      try {
+        o.onDrop(JSON.parse(e.dataTransfer.getData("text/plain")));
+      } catch {
+        /* ignore malformed drag */
+      }
+    });
+  }
+
+  treeEl.appendChild(row);
+  return row;
+}
+function appendHint(text, depth) {
+  const d = document.createElement("div");
+  d.className = "tree-hint";
+  d.style.paddingLeft = 6 + depth * 13 + "px";
+  d.textContent = text;
+  treeEl.appendChild(d);
+}
+
+/* ---- build the local virtual-folder tree ---- */
+function buildLocalTree() {
+  const root = { name: "", path: "", folders: new Map(), files: [] };
+  const ensurePath = (path) => {
+    if (!path) return root;
+    let node = root;
+    let acc = "";
+    for (const seg of path.split("/").filter(Boolean)) {
+      acc = acc ? acc + "/" + seg : seg;
+      if (!node.folders.has(seg)) {
+        node.folders.set(seg, { name: seg, path: acc, folders: new Map(), files: [] });
+      }
+      node = node.folders.get(seg);
+    }
+    return node;
+  };
+  for (const p of localFolders()) ensurePath(p);
+  for (const doc of state.library) {
+    if (doc.driveId) continue; // Drive-backed docs render under the Drive tree
+    ensurePath(doc.folder || "").files.push(doc);
+  }
+  return root;
+}
+
+/* ---- render ---- */
+function renderTree() {
+  closeContextMenu(); // an open menu's anchor row is about to be removed
+  treeEl.innerHTML = "";
+
+  makeRow({
+    depth: 0,
+    twisty: true,
+    expandedFlag: isExpanded(LOCAL_ROOT_KEY),
+    cls: "root folder",
+    icon: DEVICE_ICON,
+    name: "This browser",
+    onToggle: () => toggleExpand(LOCAL_ROOT_KEY),
+    onDrop: (d) => moveLocal(d, ""),
+    menu: () => [
+      ["New file", () => newFileLocal("")],
+      ["New folder", () => newFolderLocal("")],
+    ],
+  });
+  if (isExpanded(LOCAL_ROOT_KEY)) renderLocalFolder(buildLocalTree(), 1);
+
+  makeRow({
+    depth: 0,
+    twisty: true,
+    expandedFlag: isExpanded(DRIVE_ROOT_KEY),
+    cls: "root folder",
+    icon: CLOUD_ICON,
+    name: "Google Drive",
+    onToggle: toggleDriveRoot,
+    onDrop: state.driveRootId ? (d) => moveDrive(d, state.driveRootId) : undefined,
+    menu: state.driveRootId
+      ? () => [
+          ["New file", () => newFileDrive(state.driveRootId)],
+          ["New folder", () => newFolderDrive(state.driveRootId)],
+        ]
+      : undefined,
+  });
+  if (isExpanded(DRIVE_ROOT_KEY)) {
+    if (!google.isConfigured()) appendHint("Add a Google Client ID in Settings to use Drive.", 1);
+    else if (state.driveRootId) renderDriveChildren(state.driveRootId, 1);
+    else appendHint("Loading…", 1);
+  }
+}
+
+function renderLocalFolder(node, depth) {
+  const subs = [...node.folders.values()].sort((a, b) => a.name.localeCompare(b.name));
+  for (const sub of subs) {
+    const key = "L:" + sub.path;
+    makeRow({
+      depth,
+      twisty: true,
+      expandedFlag: isExpanded(key),
+      cls: "folder",
+      icon: FOLDER_ICON,
+      name: sub.name,
+      onToggle: () => toggleExpand(key),
+      onDrop: (d) => moveLocal(d, sub.path),
+      menu: () => [
+        ["New file", () => newFileLocal(sub.path)],
+        ["New folder", () => newFolderLocal(sub.path)],
+        ["Rename", () => renameLocalFolder(sub.path)],
+        ["Delete", () => deleteLocalFolder(sub.path), "danger"],
+      ],
+    });
+    if (isExpanded(key)) renderLocalFolder(sub, depth + 1);
+  }
+  const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+  for (const doc of files) {
+    makeRow({
+      depth,
+      twisty: false,
+      cls: "file",
+      icon: FILE_ICON,
+      name: doc.name,
+      active: doc.id === state.current?.id,
+      onActivate: () => {
+        if (doc.id !== state.current?.id) loadDoc(doc);
+      },
+      dragData: { source: "local", id: doc.id },
+      menu: () => [
+        ["Rename", () => renameLocalDoc(doc)],
+        ["Delete", () => deleteDoc(doc), "danger"],
+      ],
+    });
+  }
+  if (subs.length === 0 && files.length === 0) appendHint("Empty", depth);
+}
+
+function renderDriveChildren(folderId, depth) {
+  const c = state.driveCache[folderId];
+  if (!c) return;
+  if (c.loading) return appendHint("Loading…", depth);
+  if (c.error) return appendHint(c.error, depth);
+  const folders = c.folders.slice().sort((a, b) => a.name.localeCompare(b.name));
+  for (const f of folders) {
+    const key = "D:" + f.id;
+    makeRow({
+      depth,
+      twisty: true,
+      expandedFlag: isExpanded(key),
+      cls: "folder",
+      icon: FOLDER_ICON,
+      name: f.name,
+      onToggle: () => toggleDriveFolder(f.id, key),
+      onDrop: (d) => moveDrive(d, f.id),
+      menu: () => [
+        ["New file", () => newFileDrive(f.id)],
+        ["New folder", () => newFolderDrive(f.id)],
+        ["Rename", () => renameDriveFolder(f)],
+        ["Delete", () => deleteDriveFolder(f, folderId), "danger"],
+      ],
+    });
+    if (isExpanded(key)) renderDriveChildren(f.id, depth + 1);
+  }
+  const files = c.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+  for (const f of files) {
+    makeRow({
+      depth,
+      twisty: false,
+      cls: "file",
+      icon: FILE_ICON,
+      name: f.name,
+      active: !!state.current?.driveId && state.current.driveId === f.id,
+      onActivate: () => openDriveFile(f, folderId),
+      dragData: { source: "drive", id: f.id, parentId: folderId },
+      menu: () => [
+        ["Rename", () => renameDriveFile(f, folderId)],
+        ["Delete", () => deleteDriveFile(f, folderId), "danger"],
+      ],
+    });
+  }
+  if (c.loaded && folders.length === 0 && files.length === 0) appendHint("Empty", depth);
+}
+
+/* ---- lazy Drive loading ---- */
+async function ensureDriveReady() {
+  if (!google.isConfigured()) {
+    toast("Add your Google Client ID in Settings first.", "error");
+    openModal("settings-modal");
+    return false;
+  }
+  if (!google.isSignedIn()) await google.signIn();
+  refreshGoogleUI();
+  if (!state.driveRootId) {
+    const root = await google.drive.root();
+    state.driveRootId = root.id;
+    state.driveCache[root.id] = state.driveCache[root.id] || {
+      name: root.name,
+      folders: [],
+      files: [],
+      loaded: false,
+    };
+  }
+  return true;
+}
+async function loadDriveFolder(folderId) {
+  const c = (state.driveCache[folderId] = state.driveCache[folderId] || {
+    folders: [],
+    files: [],
+    loaded: false,
+  });
+  if (c.loaded && !c.error) return;
+  c.loading = true;
+  renderTree();
+  try {
+    const { folders, files } = await google.drive.listChildren(folderId);
+    c.folders = folders;
+    c.files = files;
+    c.loaded = true;
+    c.error = null;
+  } catch (e) {
+    c.error = e.message || "Could not list this folder.";
+  } finally {
+    c.loading = false;
+    renderTree();
+  }
+}
+async function toggleDriveRoot() {
+  if (isExpanded(DRIVE_ROOT_KEY)) {
+    setExpanded(DRIVE_ROOT_KEY, false);
+    renderTree();
     return;
   }
-  for (const doc of state.library) {
-    const li = document.createElement("li");
-    li.className = "library-item" + (doc.id === state.current?.id ? " is-active" : "");
-    li.innerHTML = `
-      <span class="library-name">${escapeHtml(doc.name)}</span>
-      ${doc.driveId ? '<span class="library-badge">Drive</span>' : ""}
-      <button class="lib-del" title="Delete">&times;</button>`;
-    li.addEventListener("click", (e) => {
-      if (e.target.closest(".lib-del")) return;
-      if (doc.id !== state.current?.id) loadDoc(doc);
-    });
-    li.querySelector(".lib-del").addEventListener("click", (e) => {
-      e.stopPropagation();
-      deleteDoc(doc);
-    });
-    libraryList.appendChild(li);
+  try {
+    if (!(await ensureDriveReady())) return;
+    setExpanded(DRIVE_ROOT_KEY, true);
+    renderTree();
+    await loadDriveFolder(state.driveRootId);
+  } catch (e) {
+    toast(e.message || "Could not reach Google Drive.", "error");
+  }
+}
+async function toggleDriveFolder(folderId, key) {
+  const willExpand = !isExpanded(key);
+  setExpanded(key, willExpand);
+  renderTree();
+  if (willExpand) await loadDriveFolder(folderId);
+}
+
+/* ---- local operations ---- */
+function newFileLocal(folderPath) {
+  setExpanded(LOCAL_ROOT_KEY, true);
+  if (folderPath) setExpanded("L:" + folderPath, true);
+  newDoc("Untitled.md", "", folderPath);
+}
+function newFolderLocal(parentPath) {
+  const name = (prompt("New folder name:") || "").trim().replace(/\//g, "-");
+  if (!name) return;
+  const path = parentPath ? parentPath + "/" + name : name;
+  const lf = localFolders();
+  if (!lf.includes(path)) lf.push(path);
+  store.saveSettings(state.settings);
+  setExpanded(LOCAL_ROOT_KEY, true);
+  if (parentPath) setExpanded("L:" + parentPath, true);
+  setExpanded("L:" + path, true);
+  renderTree();
+}
+function renameLocalDoc(doc) {
+  const name = (prompt("Rename document:", doc.name) || "").trim();
+  if (!name || name === doc.name) return;
+  doc.name = name;
+  if (doc.id === state.current?.id) docTitle.value = name;
+  persist(doc);
+}
+function renamePrefix(p, oldP, newP) {
+  if (p === oldP) return newP;
+  if (p.startsWith(oldP + "/")) return newP + p.slice(oldP.length);
+  return p;
+}
+function renameLocalFolder(path) {
+  const segs = path.split("/");
+  const cur = segs[segs.length - 1];
+  const name = (prompt("Rename folder:", cur) || "").trim().replace(/\//g, "-");
+  if (!name || name === cur) return;
+  const newPath = segs.slice(0, -1).concat(name).join("/");
+  state.settings.localFolders = localFolders().map((p) => renamePrefix(p, path, newPath));
+  for (const d of state.library) {
+    if (!d.driveId && d.folder) d.folder = renamePrefix(d.folder, path, newPath);
+  }
+  const em = expandedMap();
+  for (const k of Object.keys(em)) {
+    if (k === "L:" + path || k.startsWith("L:" + path + "/")) {
+      em["L:" + renamePrefix(k.slice(2), path, newPath)] = true;
+      delete em[k];
+    }
+  }
+  store.saveLibrary(state.library);
+  store.saveSettings(state.settings);
+  renderTree();
+  toast("Folder renamed");
+}
+function deleteLocalFolder(path) {
+  const docs = state.library.filter(
+    (d) => !d.driveId && (d.folder === path || (d.folder || "").startsWith(path + "/")),
+  );
+  if (!confirm(`Delete folder "${path}" and its ${docs.length} document(s) from this browser?`)) return;
+  const ids = new Set(docs.map((d) => d.id));
+  state.library = state.library.filter((d) => !ids.has(d.id));
+  state.settings.localFolders = localFolders().filter((p) => p !== path && !p.startsWith(path + "/"));
+  store.saveLibrary(state.library);
+  store.saveSettings(state.settings);
+  if (state.current && ids.has(state.current.id)) {
+    const next = state.library[0];
+    if (next) loadDoc(next);
+    else newDoc();
+  } else {
+    renderTree();
+  }
+  toast("Folder deleted");
+}
+function moveLocal(dragData, targetPath) {
+  if (!dragData || dragData.source !== "local") return;
+  const doc = state.library.find((d) => d.id === dragData.id);
+  if (!doc || (doc.folder || "") === targetPath) return;
+  doc.folder = targetPath;
+  if (targetPath) setExpanded("L:" + targetPath, true);
+  persist(doc);
+  toast("Moved");
+}
+
+/* ---- Drive operations ---- */
+async function newFileDrive(parentId) {
+  const raw = (prompt("New file name:", "Untitled.md") || "").trim();
+  if (!raw) return;
+  const name = ensureMdName(raw);
+  try {
+    const res = await google.drive.create(name, "", parentId);
+    const c = state.driveCache[parentId];
+    if (c && c.loaded) c.files.push(res);
+    const doc = {
+      id: uid(),
+      name: res.name || name,
+      text: "",
+      driveId: res.id,
+      driveName: res.name || name,
+      driveParentId: parentId,
+      updated: Date.now(),
+    };
+    state.library = upsertDoc(state.library, doc);
+    store.saveLibrary(state.library);
+    loadDoc(doc);
+    toast("Created in Drive", "success");
+  } catch (e) {
+    toast(e.message || "Could not create file", "error");
+  }
+}
+async function newFolderDrive(parentId) {
+  const name = (prompt("New folder name:") || "").trim().replace(/\//g, "-");
+  if (!name) return;
+  try {
+    const res = await google.drive.createFolder(name, parentId);
+    const c = state.driveCache[parentId];
+    if (c && c.loaded) c.folders.push({ id: res.id, name: res.name });
+    state.driveCache[res.id] = { name: res.name, folders: [], files: [], loaded: true };
+    renderTree();
+    toast("Folder created", "success");
+  } catch (e) {
+    toast(e.message || "Could not create folder", "error");
+  }
+}
+async function renameDriveFile(f, parentId) {
+  const name = ensureMdName((prompt("Rename file:", f.name) || "").trim());
+  if (!name || name === f.name) return;
+  try {
+    await google.drive.rename(f.id, name);
+    f.name = name;
+    const doc = state.library.find((d) => d.driveId === f.id);
+    if (doc) {
+      doc.name = name;
+      doc.driveName = name;
+      if (doc.id === state.current?.id) docTitle.value = name;
+      store.saveLibrary(state.library);
+    }
+    void parentId;
+    renderTree();
+    toast("Renamed", "success");
+  } catch (e) {
+    toast(e.message || "Could not rename", "error");
+  }
+}
+async function renameDriveFolder(f) {
+  const name = (prompt("Rename folder:", f.name) || "").trim().replace(/\//g, "-");
+  if (!name || name === f.name) return;
+  try {
+    await google.drive.rename(f.id, name);
+    f.name = name;
+    if (state.driveCache[f.id]) state.driveCache[f.id].name = name;
+    renderTree();
+    toast("Renamed", "success");
+  } catch (e) {
+    toast(e.message || "Could not rename", "error");
+  }
+}
+async function deleteDriveFile(f, parentId) {
+  if (!confirm(`Move "${f.name}" to the Google Drive trash?`)) return;
+  try {
+    await google.drive.trash(f.id);
+    const c = state.driveCache[parentId];
+    if (c) c.files = c.files.filter((x) => x.id !== f.id);
+    const doc = state.library.find((d) => d.driveId === f.id);
+    if (doc) {
+      state.library = removeDoc(state.library, doc.id);
+      store.saveLibrary(state.library);
+      if (state.current?.id === doc.id) {
+        const next = state.library[0];
+        if (next) loadDoc(next);
+        else newDoc();
+        toast("Moved to Drive trash");
+        return;
+      }
+    }
+    renderTree();
+    toast("Moved to Drive trash");
+  } catch (e) {
+    toast(e.message || "Could not delete", "error");
+  }
+}
+async function deleteDriveFolder(f, parentId) {
+  if (!confirm(`Move folder "${f.name}" and its contents to the Google Drive trash?`)) return;
+  try {
+    await google.drive.trash(f.id);
+    const c = state.driveCache[parentId];
+    if (c) c.folders = c.folders.filter((x) => x.id !== f.id);
+    delete state.driveCache[f.id];
+    renderTree();
+    toast("Moved to Drive trash");
+  } catch (e) {
+    toast(e.message || "Could not delete", "error");
+  }
+}
+async function moveDrive(dragData, targetId) {
+  if (!dragData || dragData.source !== "drive" || dragData.parentId === targetId) return;
+  try {
+    await google.drive.move(dragData.id, targetId, dragData.parentId);
+    const from = state.driveCache[dragData.parentId];
+    let moved;
+    if (from) {
+      moved = from.files.find((x) => x.id === dragData.id);
+      from.files = from.files.filter((x) => x.id !== dragData.id);
+    }
+    const to = state.driveCache[targetId];
+    if (to && to.loaded && moved) to.files.push(moved);
+    const doc = state.library.find((d) => d.driveId === dragData.id);
+    if (doc) {
+      doc.driveParentId = targetId;
+      store.saveLibrary(state.library);
+    }
+    renderTree();
+    toast("Moved");
+  } catch (e) {
+    toast(e.message || "Could not move", "error");
   }
 }
 
@@ -261,7 +827,7 @@ function deleteDoc(doc) {
     if (next) loadDoc(next);
     else newDoc();
   } else {
-    renderLibrary();
+    renderTree();
   }
   toast("Document deleted");
 }
@@ -274,7 +840,8 @@ function onEdit() {
   updateStats();
   scheduleRender();
   clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(() => persist(state.current), 500);
+  // Autosave content without rebuilding the tree (name/structure unchanged).
+  state.saveTimer = setTimeout(() => persist(state.current, { rerender: false }), 500);
 }
 
 /* ------------------------------------------------------------------ Google Drive */
@@ -324,110 +891,6 @@ async function saveToDrive(targetFolderId) {
     setSaveState("error");
     toast(e.message || "Google Drive save failed", "error");
   }
-}
-
-// ---- Drive folder browser (scoped to the app's root folder) ----
-function currentDriveFolder() {
-  return state.drive.stack[state.drive.stack.length - 1];
-}
-function showDriveStatus(msg) {
-  $("drive-status").textContent = msg || "";
-}
-
-async function openDriveBrowser() {
-  if (!google.isConfigured()) {
-    toast("Add your Google Client ID in Settings first.", "error");
-    openModal("settings-modal");
-    return;
-  }
-  openModal("drive-modal");
-  $("drive-breadcrumb").innerHTML = "";
-  $("drive-list").innerHTML = "";
-  showDriveStatus("Connecting to Google Drive…");
-  try {
-    if (!google.isSignedIn()) await google.signIn();
-    refreshGoogleUI();
-    state.drive.stack = [await google.drive.root()];
-    await renderDriveFolder();
-  } catch (e) {
-    showDriveStatus(e.message || "Could not reach Google Drive.");
-  }
-}
-
-function renderBreadcrumb() {
-  const bc = $("drive-breadcrumb");
-  bc.innerHTML = "";
-  state.drive.stack.forEach((folder, i) => {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "drive-crumb-sep";
-      sep.textContent = "›";
-      bc.appendChild(sep);
-    }
-    const b = document.createElement("button");
-    b.className = "drive-crumb";
-    b.textContent = folder.name;
-    b.addEventListener("click", () => {
-      if (i === state.drive.stack.length - 1) return;
-      state.drive.stack = state.drive.stack.slice(0, i + 1);
-      renderDriveFolder();
-    });
-    bc.appendChild(b);
-  });
-}
-
-async function renderDriveFolder() {
-  renderBreadcrumb();
-  const list = $("drive-list");
-  list.innerHTML = "";
-  showDriveStatus("Loading…");
-  const folder = currentDriveFolder();
-  try {
-    const { folders, files } = await google.drive.listChildren(folder.id);
-    if (folders.length === 0 && files.length === 0) {
-      showDriveStatus('This folder is empty. Use "New folder" or "Save current doc here".');
-      return;
-    }
-    showDriveStatus("");
-    for (const f of folders) {
-      const li = document.createElement("li");
-      li.className = "drive-item folder";
-      li.innerHTML = `<span class="di-icon">${FOLDER_ICON}</span><span class="d-name">${escapeHtml(f.name)}</span><span class="d-chevron">›</span>`;
-      li.addEventListener("click", () => {
-        state.drive.stack.push({ id: f.id, name: f.name });
-        renderDriveFolder();
-      });
-      list.appendChild(li);
-    }
-    for (const f of files) {
-      const li = document.createElement("li");
-      li.className = "drive-item file";
-      const when = f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : "";
-      li.innerHTML = `<span class="di-icon">${FILE_ICON}</span><span class="d-name">${escapeHtml(f.name)}</span><span class="d-time">${when}</span>`;
-      li.addEventListener("click", () => openDriveFile(f, folder.id));
-      list.appendChild(li);
-    }
-  } catch (e) {
-    showDriveStatus(e.message || "Could not list this folder.");
-  }
-}
-
-async function driveNewFolder() {
-  const name = prompt("New folder name:");
-  if (!name || !name.trim()) return;
-  try {
-    await google.drive.createFolder(name.trim(), currentDriveFolder().id);
-    await renderDriveFolder();
-    toast("Folder created", "success");
-  } catch (e) {
-    toast(e.message || "Could not create folder", "error");
-  }
-}
-
-async function driveSaveHere() {
-  const folder = currentDriveFolder();
-  await saveToDrive(folder.id);
-  if (state.current.driveId) closeModals();
 }
 
 async function openDriveFile(f, parentId) {
@@ -504,8 +967,10 @@ function toggleGoogleMenu() {
   menuEl.style.top = rect.bottom + 6 + "px";
   menuEl.style.left = Math.max(8, rect.right - 200) + "px";
   const actions = [
-    ["Save to Drive", saveToDrive],
-    ["Open from Drive", openDriveBrowser],
+    ["Save current doc to Drive", () => saveToDrive()],
+    ["Show Drive files", () => {
+      if (!isExpanded(DRIVE_ROOT_KEY)) toggleDriveRoot();
+    }],
     ["Sign out", doSignOut],
   ];
   for (const [label, fn] of actions) {
@@ -830,12 +1295,26 @@ function wireEvents() {
     }
   });
 
-  docTitle.addEventListener("change", () => {
+  docTitle.addEventListener("change", async () => {
     if (!state.current) return;
-    state.current.name = docTitle.value.trim() || "Untitled.md";
+    const name = docTitle.value.trim() || "Untitled.md";
+    if (name === state.current.name) return;
+    state.current.name = name;
+    // Rename in place at the source: Drive files rename via API immediately.
+    if (state.current.driveId) {
+      const finalName = ensureMdName(name);
+      try {
+        await google.drive.rename(state.current.driveId, finalName);
+        state.current.name = finalName;
+        state.current.driveName = finalName;
+        docTitle.value = finalName;
+        toast("Renamed on Drive", "success");
+      } catch (e) {
+        toast(e.message || "Could not rename on Drive", "error");
+      }
+    }
     persist(state.current);
     updateStorageLoc();
-    renderLibrary();
   });
 
   document.querySelectorAll("[data-fmt]").forEach((b) =>
@@ -850,13 +1329,12 @@ function wireEvents() {
   $("btn-help").addEventListener("click", () => openModal("help-modal"));
   $("btn-settings").addEventListener("click", () => openModal("settings-modal"));
   $("btn-open-local").addEventListener("click", openLocalFile);
-  $("btn-open-drive").addEventListener("click", openDriveBrowser);
+  $("btn-new-file").addEventListener("click", () => newFileLocal(""));
+  $("btn-new-folder").addEventListener("click", () => newFolderLocal(""));
   $("btn-share").addEventListener("click", shareLink);
   $("btn-export").addEventListener("click", () => openModal("export-modal"));
   $("btn-google").addEventListener("click", onGoogleButton);
   $("set-save").addEventListener("click", saveSettings);
-  $("drive-newfolder").addEventListener("click", driveNewFolder);
-  $("drive-savehere").addEventListener("click", driveSaveHere);
 
   document.querySelectorAll("[data-export]").forEach((b) =>
     b.addEventListener("click", () => doExport(b.dataset.export)),
@@ -915,6 +1393,14 @@ function quickSave() {
 function init() {
   state.settings = store.loadSettings();
   state.library = store.loadLibrary();
+
+  // Expand the local root by default on first run.
+  if (!state.settings.expanded) state.settings.expanded = { [LOCAL_ROOT_KEY]: true };
+  // Drive is remote + lazy: reset its expand state each session so we never get
+  // stuck on "Loading…" or force a sign-in popup on page load.
+  for (const k of Object.keys(state.settings.expanded)) {
+    if (k === DRIVE_ROOT_KEY || k.startsWith("D:")) delete state.settings.expanded[k];
+  }
 
   // theme
   const prefersDark =

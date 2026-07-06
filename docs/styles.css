@@ -271,49 +271,93 @@ button { font-family: inherit; }
 }
 .ghost-btn:hover { background: var(--bg-hover); border-color: var(--text-muted); }
 
-.library-list, .drive-list { list-style: none; margin: 0; padding: 0; }
-.library-item {
+/* Unified file tree (local docs + Google Drive), one row per node. */
+.tree { font-size: 13px; user-select: none; }
+.tree-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 7px 8px;
+  gap: 3px;
+  padding: 4px 6px;
   border-radius: var(--radius);
   cursor: pointer;
-  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.tree-row:hover { background: var(--bg-hover); }
+.tree-row.is-active { background: var(--accent); color: var(--accent-fg); }
+.tree-row.is-active .tree-icon,
+.tree-row.is-active .tree-twisty,
+.tree-row.is-active .tree-kebab { color: var(--accent-fg); }
+.tree-row.drop-target { box-shadow: inset 0 0 0 2px var(--accent); }
+
+.tree-twisty {
+  width: 14px;
+  flex-shrink: 0;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: transform 0.1s;
+}
+.tree-twisty.spacer { visibility: hidden; }
+.tree-row.expanded > .tree-twisty { transform: rotate(90deg); }
+
+.tree-icon { flex-shrink: 0; display: inline-flex; color: var(--text-secondary); }
+.tree-row.folder .tree-icon,
+.tree-row.root .tree-icon { color: var(--accent); }
+.tree-row.root .tree-label { font-weight: 600; }
+.tree-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.tree-rename {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  padding: 1px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg);
   color: var(--text);
 }
-.library-item:hover { background: var(--bg-hover); }
-.library-item.is-active { background: var(--accent); color: var(--accent-fg); }
-.library-item.is-active .library-meta,
-.library-item.is-active .lib-del { color: var(--accent-fg); opacity: 0.85; }
-.library-name {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.library-meta { font-size: 11px; color: var(--text-muted); }
-.library-badge {
-  font-size: 9.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  padding: 1px 4px;
-  border-radius: 4px;
-  background: var(--bg-inset);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-muted);
-}
-.lib-del {
+.tree-badge { font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
+.tree-kebab {
   border: none;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 14px;
-  padding: 0 2px;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 3px;
   opacity: 0;
+  flex-shrink: 0;
 }
-.library-item:hover .lib-del { opacity: 1; }
-.lib-del:hover { color: var(--danger); }
+.tree-row:hover .tree-kebab { opacity: 1; }
+.tree-kebab:hover { color: var(--text); }
+.tree-hint { padding: 5px 8px; font-size: 12px; color: var(--text-muted); }
+
+/* Right-click / kebab context menu */
+.ctx-menu {
+  position: fixed;
+  z-index: 55;
+  min-width: 158px;
+  padding: 5px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+.ctx-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 5px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.ctx-menu button:hover { background: var(--bg-hover); }
+.ctx-menu button.danger { color: var(--danger); }
+.ctx-menu button.danger:hover { background: var(--danger); color: #fff; }
 
 /* Outline */
 .outline { font-size: 13px; }
@@ -563,59 +607,6 @@ button { font-family: inherit; }
   padding: 1px 4px;
   border-radius: 3px;
 }
-
-/* Drive browser */
-.drive-status { color: var(--text-secondary); font-size: 13px; padding: 6px 0 10px; }
-.drive-status:empty { display: none; }
-
-.drive-breadcrumb {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px;
-  font-size: 13px;
-  padding-bottom: 10px;
-  margin-bottom: 8px;
-  border-bottom: 1px solid var(--border-muted);
-}
-.drive-crumb {
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  cursor: pointer;
-  padding: 2px 4px;
-  border-radius: 4px;
-  font-size: 13px;
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.drive-crumb:hover { background: var(--bg-hover); }
-.drive-crumb:last-child { color: var(--text); font-weight: 600; cursor: default; }
-.drive-crumb:last-child:hover { background: transparent; }
-.drive-crumb-sep { color: var(--text-muted); }
-
-.drive-item {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-.drive-item:hover { background: var(--bg-hover); }
-.drive-item .di-icon { flex-shrink: 0; display: inline-flex; color: var(--text-secondary); }
-.drive-item.folder .di-icon { color: var(--accent); }
-.drive-item .d-name {
-  flex: 1;
-  font-size: 13px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.drive-item .d-time { font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
-.drive-item .d-chevron { color: var(--text-muted); flex-shrink: 0; }
 
 /* Export grid */
 .export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }

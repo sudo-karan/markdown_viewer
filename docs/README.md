@@ -15,12 +15,15 @@ Google Drive sync.
   `> [!NOTE]`-style alerts.
 - **Rich rendering** — syntax highlighting (highlight.js), **Mermaid** diagrams,
   and **KaTeX** math (`$…$` and `$$…$$`).
-- **Local-first** — every document autosaves to your browser. Open files from
+- **Folder tree sidebar** — one tree over two sources: **This browser** (local
+  documents in virtual folders) and **Google Drive** (your `markdowns` folder,
+  loaded on demand). Create folders, drag files between them, and rename — each
+  change is written straight back to its source (localStorage or Drive).
+- **Local-first** — every document autosaves to your browser. Import files from
   disk, drag-and-drop, or paste an image to embed it as a data URI.
-- **Google Drive sync** (optional) — sign in with Google and save/open documents
-  in your own Drive, organized into **folders**. The app browses a single root
-  folder (`markdowns` by default) and the subfolders you create inside it — and,
-  by design, can see *nothing else* in your Drive.
+- **Google Drive sync** (optional) — sign in with Google and keep documents in
+  your own Drive under a single root folder (`markdowns` by default). By design
+  the app can see *nothing else* in your Drive.
 - **Export & share** — download `.md` or a self-contained `.html`, copy rendered
   HTML, print to PDF, or copy a link that encodes the whole document in the URL.
 - **Themes** — GitHub light/dark, following your system preference.
@@ -70,18 +73,22 @@ share — it is *not* a secret):
 Also enable the **Google Drive API** for the project (APIs & Services →
 Library → "Google Drive API" → Enable), otherwise Drive calls fail with a 403.
 
-### Folders
+### The sidebar tree
 
-Open **Drive…** to browse a root folder named **`markdowns`** (created on first
-use; change the name in [`config.js`](./config.js) → `driveFolderName`). Inside
-it you can:
+The sidebar shows one tree with two roots:
 
-- navigate subfolders via the breadcrumb,
-- create subfolders with **New folder**, and
-- place the current document into the folder you're viewing with **Save current
-  doc here** (this also *moves* a document that's already in Drive).
+- **This browser** — local documents, organized into virtual folders that live
+  in your browser. Use **New file** / **New folder**, drag a file onto a folder
+  to move it, or rename/delete from a row's **⋯** menu.
+- **Google Drive** — expand it to load your **`markdowns`** root folder (created
+  on first use; rename it in [`config.js`](./config.js) → `driveFolderName`).
+  Create subfolders, drag files between them, rename, and delete (deletes move
+  the item to the Drive trash). New files are created directly in Drive.
 
-Because the scope is `drive.file`, the app only ever sees this `markdowns`
+Renaming or saving writes straight back to wherever the file lives — localStorage
+for local docs, the Drive API for Drive files.
+
+Because the scope is `drive.file`, the app only ever sees the `markdowns`
 subtree — specifically, the folders and files **it** creates or that you open
 through it. Files you add to `markdowns` manually from the Drive website won't
 appear here (that would require a broader, Google-verified scope, which this app
