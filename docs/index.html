@@ -52,6 +52,9 @@
     <div id="app" class="app">
       <!-- ============================ Header ============================ -->
       <header class="app-header">
+        <button id="sidebar-toggle" class="icon-btn sidebar-toggle" title="Show or hide the sidebar" aria-label="Toggle sidebar" aria-expanded="true">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25H5v-13Zm4.75 13h7.75a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25H6.5Z"/></svg>
+        </button>
         <div class="brand" title="Markdown Studio">
           <img src="./favicon.svg" alt="" width="22" height="22" />
           <span class="brand-name">Markdown&nbsp;Studio</span>
@@ -146,10 +149,6 @@
           </div>
         </aside>
 
-        <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">
-          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25H5v-13Zm4.75 13h7.75a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25H6.5Z"/></svg>
-        </button>
-
         <!-- Editor -->
         <section class="pane editor-pane" id="editor-pane">
           <textarea
@@ -178,6 +177,8 @@
           <span id="storage-loc" class="storage-loc">Local</span>
         </div>
         <div class="status-right">
+          <button id="btn-download" class="link-btn" title="Download this document as a .md file">Download</button>
+          <button id="btn-pdf" class="link-btn" title="Export to PDF (opens the print dialog)">PDF</button>
           <button id="btn-share" class="link-btn" title="Copy a shareable link (content encoded in the URL)">Share link</button>
           <button id="btn-export" class="link-btn" title="Export / download">Export</button>
           <span class="status-dot">&middot;</span>
@@ -257,9 +258,9 @@
         <ul class="feature-list">
           <li>GitHub-flavored Markdown: tables, task lists, footnotes, alerts (<code>&gt; [!NOTE]</code>)</li>
           <li>Syntax highlighting, Mermaid diagrams, and KaTeX math (<code>$…$</code>, <code>$$…$$</code>)</li>
-          <li>Live split preview with synced scrolling and a clickable outline</li>
+          <li>Live split preview with synced scrolling; click the preview to jump to its source</li>
           <li>Local-first: autosaves to your browser; open/save files from disk</li>
-          <li>Google Drive sync and an optional activity log to your own Sheet</li>
+          <li>Google Drive sync using the least-privilege <code>drive.file</code> scope</li>
           <li>Paste an image to embed it, and share a doc as a self-contained link</li>
         </ul>
       </div>

@@ -157,7 +157,28 @@ function updateCursor() {
 }
 
 /* ------------------------------------------------------------------ rendering */
+const BLANK_PREVIEW_HTML = `
+  <div class="preview-empty">
+    <div class="preview-empty-icon" aria-hidden="true">📝</div>
+    <p class="preview-empty-title">This document is blank</p>
+    <p class="preview-empty-sub">
+      Switch to <button type="button" class="preview-empty-cta">Edit</button>
+      and start writing — your Markdown renders here as you type.
+    </p>
+  </div>`;
+
 async function renderNow() {
+  // An empty document would otherwise render as a blank pane, which reads as
+  // "still loading". Show an explicit placeholder that also points at Edit mode.
+  if (!editor.value.trim()) {
+    preview.innerHTML = BLANK_PREVIEW_HTML;
+    preview.querySelector(".preview-empty-cta")?.addEventListener("click", () => {
+      setView("edit");
+      editor.focus();
+    });
+    buildOutline();
+    return;
+  }
   const html = renderMarkdown(editor.value);
   preview.innerHTML = html;
   await enhance(preview, { dark: state.dark });
@@ -1081,13 +1102,109 @@ const FORMATTERS = {
   hr: () => insertBlock("---\n"),
 };
 
-/* ------------------------------------------------------------------ scroll sync */
-function syncScroll(fromEl, toEl) {
+/* ------------------------------------------------------------------ scroll sync
+ * The preview's scroll container is `.preview-pane` (the .pane wrapper), NOT the
+ * inner #preview article — setting scrollTop on #preview is a no-op. We align the
+ * two panes by the `data-source-line` anchors render.js stamps on block elements:
+ * the source line at the top of the editor maps to the matching preview element,
+ * and vice-versa. Falls back to a proportional map when no anchors are present.
+ */
+const previewPane = $("preview-pane");
+
+let editorLineH = 0;
+function lineHeightPx() {
+  if (editorLineH) return editorLineH;
+  const lh = parseFloat(getComputedStyle(editor).lineHeight);
+  const fs = parseFloat(getComputedStyle(editor).fontSize) || 14;
+  editorLineH = Number.isFinite(lh) && lh > 0 ? lh : fs * 1.7;
+  return editorLineH;
+}
+
+// Preview anchors as {line, top}, where `top` is the element's offset from the
+// top of the scrollable content (independent of the current scroll position).
+function previewAnchors() {
+  const base = previewPane.getBoundingClientRect().top - previewPane.scrollTop;
+  const out = [];
+  for (const el of preview.querySelectorAll("[data-source-line]")) {
+    const line = Number(el.getAttribute("data-source-line"));
+    if (Number.isFinite(line)) out.push({ line, top: el.getBoundingClientRect().top - base });
+  }
+  return out;
+}
+function lerp(x, x0, x1, y0, y1) {
+  return x1 === x0 ? y0 : y0 + ((x - x0) / (x1 - x0)) * (y1 - y0);
+}
+function withScrollGuard(fn) {
   if (state.syncingScroll) return;
   state.syncingScroll = true;
-  const ratio = fromEl.scrollTop / Math.max(1, fromEl.scrollHeight - fromEl.clientHeight);
-  toEl.scrollTop = ratio * (toEl.scrollHeight - toEl.clientHeight);
+  fn();
   requestAnimationFrame(() => (state.syncingScroll = false));
+}
+
+// Editor scrolled → move the preview so the same source line sits at the top.
+function syncPreviewToEditor() {
+  if (state.syncingScroll || state.view !== "split") return;
+  const topLine = editor.scrollTop / lineHeightPx();
+  const anchors = previewAnchors();
+  let target;
+  if (anchors.length) {
+    let a = anchors[0];
+    let b = anchors[anchors.length - 1];
+    for (const p of anchors) {
+      if (p.line <= topLine) a = p;
+      if (p.line >= topLine) { b = p; break; }
+    }
+    target = lerp(topLine, a.line, b.line, a.top, b.top);
+  } else {
+    const ratio = editor.scrollTop / Math.max(1, editor.scrollHeight - editor.clientHeight);
+    target = ratio * (previewPane.scrollHeight - previewPane.clientHeight);
+  }
+  withScrollGuard(() => (previewPane.scrollTop = target));
+}
+
+// Preview scrolled → move the editor to the matching source line.
+function syncEditorToPreview() {
+  if (state.syncingScroll || state.view !== "split") return;
+  const y = previewPane.scrollTop; // viewport top in content coordinates
+  const anchors = previewAnchors();
+  let line;
+  if (anchors.length) {
+    let a = anchors[0];
+    let b = anchors[anchors.length - 1];
+    for (const p of anchors) {
+      if (p.top <= y) a = p;
+      if (p.top >= y) { b = p; break; }
+    }
+    line = lerp(y, a.top, b.top, a.line, b.line);
+  } else {
+    const ratio = previewPane.scrollTop / Math.max(1, previewPane.scrollHeight - previewPane.clientHeight);
+    line = ratio * editor.value.split("\n").length;
+  }
+  withScrollGuard(() => (editor.scrollTop = line * lineHeightPx()));
+}
+
+// Clicking a preview block selects and reveals its source line in the editor.
+function jumpToSource(e) {
+  if (state.view !== "split") return;
+  if (e.target.closest("a, input, button, .anchor-link")) return;
+  const el = e.target.closest("[data-source-line]");
+  if (!el) return;
+  const line = Number(el.getAttribute("data-source-line"));
+  if (!Number.isFinite(line)) return;
+  const lines = editor.value.split("\n");
+  let start = 0;
+  for (let i = 0; i < line && i < lines.length; i++) start += lines[i].length + 1;
+  const end = start + (lines[line] ? lines[line].length : 0);
+  editor.focus();
+  editor.setSelectionRange(start, end);
+  withScrollGuard(() => {
+    editor.scrollTop = Math.max(0, line * lineHeightPx() - editor.clientHeight / 3);
+  });
+  updateCursor();
+  const pane = $("editor-pane");
+  pane.classList.remove("flash");
+  void pane.offsetWidth; // restart the animation
+  pane.classList.add("flash");
 }
 
 /* ------------------------------------------------------------------ files: open / drop / paste */
@@ -1156,20 +1273,36 @@ function standaloneHtml() {
 </head><body><article class="markdown-body">${preview.innerHTML}</article></body></html>`;
 }
 
+function docBaseName() {
+  return (state.current?.name || "document").replace(/\.(md|markdown|txt|mmd)$/i, "");
+}
+
+// Download the current document as a .md file to the browser's downloads folder.
+function downloadMd() {
+  const name = docBaseName() + ".md";
+  download(name, editor.value);
+  toast(`Downloaded ${name}`, "success");
+}
+
+// Export to PDF via the browser's print dialog (where paper size, margins, and
+// "Save as PDF" live). The `@media print` stylesheet isolates the rendered
+// preview, so no popup window is needed.
+async function printPreview() {
+  closeModals();
+  // Make sure the preview reflects the latest keystrokes before the dialog opens.
+  clearTimeout(state.renderTimer);
+  await renderNow();
+  window.print();
+}
+
 function doExport(kind) {
   closeModals();
-  const name = (state.current?.name || "document").replace(/\.(md|markdown|txt)$/i, "");
-  if (kind === "md") download(name + ".md", editor.value);
+  const name = docBaseName();
+  if (kind === "md") downloadMd();
   else if (kind === "html") download(name + ".html", standaloneHtml(), "text/html");
   else if (kind === "copy-html")
     navigator.clipboard.writeText(preview.innerHTML).then(() => toast("Rendered HTML copied", "success"));
-  else if (kind === "print") {
-    const w = window.open("", "_blank");
-    if (!w) return toast("Popup blocked", "error");
-    w.document.write(standaloneHtml());
-    w.document.close();
-    w.onload = () => w.print();
-  }
+  else if (kind === "print") printPreview();
 }
 
 function shareLink() {
@@ -1264,13 +1397,57 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* ------------------------------------------------------------------ tooltips
+ * The native `title` tooltip only appears after a long browser delay. Replace it
+ * on the chrome buttons with a lightweight custom tooltip that shows instantly.
+ * Rendered into <body> (position: fixed) so it escapes the toolbar's overflow
+ * clipping; `aria-label` preserves the accessible name we take off `title`.
+ */
+let tipEl = null;
+function showTip(e) {
+  const el = e.currentTarget;
+  const text = el.dataset.tip;
+  if (!text || !tipEl) return;
+  tipEl.textContent = text;
+  tipEl.classList.add("show");
+  const r = el.getBoundingClientRect();
+  const tw = tipEl.offsetWidth;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - tw - 6));
+  tipEl.style.left = left + "px";
+  tipEl.style.top = r.bottom + 6 + "px";
+}
+function hideTip() {
+  tipEl?.classList.remove("show");
+}
+function setupFastTooltips() {
+  tipEl = document.createElement("div");
+  tipEl.className = "tip";
+  tipEl.setAttribute("role", "tooltip");
+  document.body.appendChild(tipEl);
+  const els = document.querySelectorAll(
+    ".toolbar [title], .header-actions .icon-btn[title], .side-actions [title]",
+  );
+  els.forEach((el) => {
+    const t = el.getAttribute("title");
+    if (!t) return;
+    el.dataset.tip = t;
+    if (!el.hasAttribute("aria-label")) el.setAttribute("aria-label", t);
+    el.removeAttribute("title"); // suppress the slow native tooltip
+    el.addEventListener("mouseenter", showTip);
+    el.addEventListener("mouseleave", hideTip);
+    el.addEventListener("mousedown", hideTip);
+  });
+}
+
 /* ------------------------------------------------------------------ wiring */
 function wireEvents() {
   editor.addEventListener("input", onEdit);
   editor.addEventListener("keyup", updateCursor);
   editor.addEventListener("click", updateCursor);
-  editor.addEventListener("scroll", () => syncScroll(editor, preview));
-  preview.addEventListener("scroll", () => syncScroll(preview, editor));
+  editor.addEventListener("scroll", syncPreviewToEditor);
+  previewPane.addEventListener("scroll", syncEditorToPreview);
+  preview.addEventListener("click", jumpToSource);
   editor.addEventListener("paste", handlePaste);
   editor.addEventListener("dragover", (e) => e.preventDefault());
   editor.addEventListener("drop", handleDrop);
@@ -1331,6 +1508,8 @@ function wireEvents() {
   $("btn-open-local").addEventListener("click", openLocalFile);
   $("btn-new-file").addEventListener("click", () => newFileLocal(""));
   $("btn-new-folder").addEventListener("click", () => newFolderLocal(""));
+  $("btn-download").addEventListener("click", downloadMd);
+  $("btn-pdf").addEventListener("click", printPreview);
   $("btn-share").addEventListener("click", shareLink);
   $("btn-export").addEventListener("click", () => openModal("export-modal"));
   $("btn-google").addEventListener("click", onGoogleButton);
@@ -1350,8 +1529,9 @@ function wireEvents() {
     }),
   );
   $("sidebar-toggle").addEventListener("click", () => {
-    app.classList.toggle("sidebar-collapsed");
-    state.settings.sidebarCollapsed = app.classList.contains("sidebar-collapsed");
+    const collapsed = app.classList.toggle("sidebar-collapsed");
+    $("sidebar-toggle").setAttribute("aria-expanded", String(!collapsed));
+    state.settings.sidebarCollapsed = collapsed;
     store.saveSettings(state.settings);
   });
 
@@ -1410,7 +1590,10 @@ function init() {
 
   // view + sidebar
   setView(state.settings.view || "split");
-  if (state.settings.sidebarCollapsed) app.classList.add("sidebar-collapsed");
+  if (state.settings.sidebarCollapsed) {
+    app.classList.add("sidebar-collapsed");
+    $("sidebar-toggle").setAttribute("aria-expanded", "false");
+  }
 
   // google
   const clientId = state.settings.googleClientId || CONFIG.googleClientId || "";
@@ -1419,6 +1602,7 @@ function init() {
 
   wireEvents();
   setupDivider();
+  setupFastTooltips();
 
   // Signal the HTML fallback watchdog that the module graph loaded and the app
   // booted (see the inline script in index.html).
