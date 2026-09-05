@@ -24,8 +24,14 @@ window.MO_STUDIO_CONFIG = {
   // Settings). See docs/README.md for the 2-minute setup.
   googleClientId: "",
 
-  // Name of the root folder in your Google Drive that this app manages. The app
-  // only ever sees this folder and the subfolders/files it creates inside it —
-  // never the rest of your Drive (drive.file scope).
-  driveFolderName: "markdowns",
+  // Name of the root folder this app creates in your Google Drive. It is an
+  // ordinary folder in "My Drive" — you can open, move and rename it from the
+  // Drive website like any other. (The drive.file scope limits what the *app*
+  // can see, not what *you* can see.)
+  driveFolderName: "markdown_sudo-karan",
+
+  // Folder names this deployment used before. If the folder above doesn't exist
+  // yet but one of these does, the app renames that one instead of starting a
+  // new empty folder — so changing driveFolderName never strands documents.
+  legacyDriveFolderNames: ["markdowns"],
 };

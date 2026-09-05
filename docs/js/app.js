@@ -2086,7 +2086,7 @@ function saveSettings() {
   const id = $("set-client-id").value.trim();
   state.settings.googleClientId = id;
   store.saveSettings(state.settings);
-  google.configure(id, CONFIG.driveFolderName);
+  google.configure(id, CONFIG.driveFolderName, CONFIG.legacyDriveFolderNames);
   refreshGoogleUI();
   closeModals();
   toast("Settings saved", "success");
@@ -2378,16 +2378,19 @@ function init() {
     (!state.settings.theme && window.matchMedia?.("(prefers-color-scheme: dark)").matches !== false);
   applyTheme(state.settings.theme ? state.settings.theme === "dark" : prefersDark);
 
-  // view + sidebar
+  // view + sidebar. On a phone the sidebar overlays the document, so start it
+  // closed unless this browser has an explicit preference saved.
   setView(state.settings.view || "split");
-  if (state.settings.sidebarCollapsed) {
+  const narrow = window.matchMedia?.("(max-width: 720px)")?.matches === true;
+  const collapsed = state.settings.sidebarCollapsed ?? narrow;
+  if (collapsed) {
     app.classList.add("sidebar-collapsed");
     $("sidebar-toggle").setAttribute("aria-expanded", "false");
   }
 
   // google
   const clientId = state.settings.googleClientId || CONFIG.googleClientId || "";
-  google.configure(clientId, CONFIG.driveFolderName);
+  google.configure(clientId, CONFIG.driveFolderName, CONFIG.legacyDriveFolderNames);
   refreshGoogleUI();
 
   wireEvents();

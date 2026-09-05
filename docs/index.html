@@ -93,6 +93,9 @@
 
       <!-- ============================ Toolbar ============================ -->
       <div class="toolbar" role="toolbar" aria-label="Editor toolbar">
+        <!-- Only the formatting buttons scroll sideways; Files and the view
+             modes stay pinned so they remain reachable on a phone. -->
+        <div class="toolbar-scroll">
         <div class="toolbar-group">
           <button class="icon-btn" data-fmt="bold" title="Bold (Ctrl/Cmd+B)"><b>B</b></button>
           <button class="icon-btn" data-fmt="italic" title="Italic (Ctrl/Cmd+I)"><i>I</i></button>
@@ -118,6 +121,7 @@
         </div>
 
         <div class="toolbar-spacer"></div>
+        </div>
 
         <button id="btn-files" class="ghost-btn files-btn" title="Browse all files with sizes and dates" aria-label="Browse files">
           <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"></path></svg>
