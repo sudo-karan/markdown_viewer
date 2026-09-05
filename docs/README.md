@@ -49,7 +49,25 @@ to Pages on every push to `main`. Just enable it:
 All asset paths in `docs/` are **relative**, so the app works from any subpath
 (e.g. `/<repo>/`) with no configuration.
 
-## Enable Google Drive (optional, ~2 minutes)
+## Turn on accounts + Drive (~2 minutes, once per site)
+
+Setting a Client ID does double duty: it enables Drive sync **and** turns
+"Sign in with Google" into the app's account system.
+
+- **You configure it once.** Put the Client ID in
+  [`docs/config.js`](./config.js) and nobody else ever handles a key.
+- **Everyone gets their own account.** Each visitor clicks *Sign in with
+  Google*; their documents live in **their own** Drive and follow them to any
+  device they sign in on.
+- **A shared browser stays separated.** Each signed-in account gets its own
+  local library, so two people on one laptop or tablet never see each other's
+  files. (This is isolation, not a security boundary — anyone at the keyboard
+  can read the browser's storage. The durable, private copy is each user's Drive.)
+- **Signed out still works.** Without signing in, the app is a local,
+  this-browser-only editor exactly as before.
+
+There are no passwords to store: Google is the identity provider, and the app
+never sees a credential.
 
 A GitHub Pages site can't keep secrets, so Drive access uses Google's standard
 browser OAuth flow. You only need a **Client ID** (which is public and safe to
@@ -62,8 +80,11 @@ share — it is *not* a secret):
 4. Under **Authorized JavaScript origins**, add your Pages origin, e.g.
    `https://<user>.github.io`. (Origins are scheme + host only — no path.)
 5. Copy the **Client ID**.
-6. Either paste it into the app's **Settings** dialog, or commit it to
-   [`docs/config.js`](./config.js) as `googleClientId`.
+6. Commit it to [`docs/config.js`](./config.js) as `googleClientId` — that is
+   what enables sign-in for everyone who visits the site. (Pasting it into the
+   in-app **Settings** dialog also works, but only for that one browser.)
+7. Add every person who should be able to sign in as a **test user** on the
+   OAuth consent screen, until you publish/verify the app.
 
 > [!NOTE]
 > The app requests the least-privilege **`drive.file`** scope: it can only see
@@ -87,6 +108,23 @@ The sidebar shows one tree with two roots:
 
 Renaming or saving writes straight back to wherever the file lives — localStorage
 for local docs, the Drive API for Drive files.
+
+### The Files view
+
+The **Files** button in the toolbar opens a full-width browser over both
+sources, with folder navigation (breadcrumbs) and sortable **Name / Size /
+Created / Modified** columns — click a column heading to sort, click again to
+reverse. Local folders roll their contents up, so a folder's size is the total
+of everything inside it and its dates span its oldest and newest documents.
+Clicking a file opens it; the **⋯** menu renames or deletes.
+
+### Getting browser-only files onto your other devices
+
+Documents created while signed out live only in that browser. Once signed in,
+the account menu (click your name, top-right) offers **"Sync N browser-only
+files to Drive"**, which uploads them so they're reachable from anywhere you
+sign in. The first time you sign in on a browser that already has documents,
+they're adopted into your account automatically so nothing appears to vanish.
 
 Because the scope is `drive.file`, the app only ever sees the `markdowns`
 subtree — specifically, the folders and files **it** creates or that you open

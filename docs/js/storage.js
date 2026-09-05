@@ -5,9 +5,32 @@
  * "library". Connecting Google Drive is purely additive — a Drive file id is
  * stored alongside a document so saves can round-trip.
  */
-const LIB_KEY = "mds:library:v2";
-const SETTINGS_KEY = "mds:settings:v1";
-const CURRENT_KEY = "mds:current:v1";
+/*
+ * Per-account namespacing
+ * ----------------------
+ * Several people may share one browser (a family tablet, a shared laptop), and
+ * each signs in with their own Google account. Every key is therefore suffixed
+ * with an account namespace so one user's library is never visible to another:
+ *   signed out -> "anon"      signed in -> the Google account's stable `sub` id
+ * Nothing here is a security boundary (localStorage is readable by anyone at the
+ * keyboard) — it is isolation so accounts don't clobber or leak into each other.
+ * The real cross-device store is the user's own Google Drive.
+ */
+const BASE_LIB = "mds:library:v2";
+const BASE_SETTINGS = "mds:settings:v1";
+const BASE_CURRENT = "mds:current:v1";
+
+const ANON = "anon";
+let ns = ANON;
+
+/** Switch the active account namespace (null/empty → signed-out). */
+export function setAccount(accountId) {
+  ns = accountId ? String(accountId) : ANON;
+}
+export function getAccount() {
+  return ns;
+}
+const key = (base, forNs = ns) => `${base}:${forNs}`;
 
 // Every localStorage access is guarded: in private mode or when storage is
 // blocked/full, reads fall back and writes no-op instead of throwing (which
@@ -50,28 +73,46 @@ export function uid() {
   return "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
+/*
+ * One-time migration: documents saved before per-account namespacing existed
+ * live under the un-suffixed keys. Adopt them into the signed-out namespace on
+ * first run so nobody's existing work disappears when they update the app.
+ */
+function migrateLegacyKeys() {
+  for (const base of [BASE_LIB, BASE_SETTINGS, BASE_CURRENT]) {
+    const legacy = lsGet(base);
+    if (legacy !== null && lsGet(key(base, ANON)) === null) lsSet(key(base, ANON), legacy);
+  }
+}
+migrateLegacyKeys();
+
 export const store = {
-  /** @returns {Array<{id,name,text,driveId,updated}>} */
+  /** @returns {Array<{id,name,text,driveId,created,updated}>} */
   loadLibrary() {
-    return safeParse(lsGet(LIB_KEY), []);
+    return safeParse(lsGet(key(BASE_LIB)), []);
   },
   saveLibrary(lib) {
-    lsSet(LIB_KEY, JSON.stringify(lib));
+    lsSet(key(BASE_LIB), JSON.stringify(lib));
   },
 
   loadSettings() {
-    return safeParse(lsGet(SETTINGS_KEY), {});
+    return safeParse(lsGet(key(BASE_SETTINGS)), {});
   },
   saveSettings(s) {
-    lsSet(SETTINGS_KEY, JSON.stringify(s));
+    lsSet(key(BASE_SETTINGS), JSON.stringify(s));
   },
 
   getCurrentId() {
-    return lsGet(CURRENT_KEY) || null;
+    return lsGet(key(BASE_CURRENT)) || null;
   },
   setCurrentId(id) {
-    if (id) lsSet(CURRENT_KEY, id);
-    else lsRemove(CURRENT_KEY);
+    if (id) lsSet(key(BASE_CURRENT), id);
+    else lsRemove(key(BASE_CURRENT));
+  },
+
+  /** Read another namespace's library without switching to it. */
+  loadLibraryOf(accountId) {
+    return safeParse(lsGet(key(BASE_LIB, accountId || ANON)), []);
   },
 };
 
