@@ -16,13 +16,13 @@ Google Drive sync.
 - **Rich rendering** — syntax highlighting (highlight.js), **Mermaid** diagrams,
   and **KaTeX** math (`$…$` and `$$…$$`).
 - **Folder tree sidebar** — one tree over two sources: **This browser** (local
-  documents in virtual folders) and **Google Drive** (your `markdowns` folder,
+  documents in virtual folders) and **Google Drive** (your `markdown_sudo-karan` folder,
   loaded on demand). Create folders, drag files between them, and rename — each
   change is written straight back to its source (localStorage or Drive).
 - **Local-first** — every document autosaves to your browser. Import files from
   disk, drag-and-drop, or paste an image to embed it as a data URI.
 - **Google Drive sync** (optional) — sign in with Google and keep documents in
-  your own Drive under a single root folder (`markdowns` by default). By design
+  your own Drive under a single root folder (`markdown_sudo-karan` by default). By design
   the app can see *nothing else* in your Drive.
 - **Export & share** — download `.md` or a self-contained `.html`, copy rendered
   HTML, print to PDF, or copy a link that encodes the whole document in the URL.
@@ -91,6 +91,23 @@ share — it is *not* a secret):
 > and manage files it creates or that you explicitly open with it — never your
 > whole Drive.
 
+### Where your files live in Drive
+
+The app creates one ordinary folder in **My Drive**, named by `driveFolderName`
+in [`config.js`](./config.js) (currently `markdown_sudo-karan`). It is a normal
+folder: you can open, move, rename or share it from the Drive website like any
+other, and everything the app saves is inside it.
+
+> [!NOTE]
+> `drive.file` limits what **the app** can see, not what **you** can see. If the
+> folder doesn't appear in your Drive, the usual reasons are that no Drive
+> sign-in has completed yet (so it was never created), or you're signed into a
+> different Google account on the web than in the app.
+
+Renaming `driveFolderName` later is safe: if the new name doesn't exist but a
+name listed in `legacyDriveFolderNames` does, the app **renames that folder**
+rather than starting an empty one, so your documents come with it.
+
 Also enable the **Google Drive API** for the project (APIs & Services →
 Library → "Google Drive API" → Enable), otherwise Drive calls fail with a 403.
 
@@ -101,7 +118,7 @@ The sidebar shows one tree with two roots:
 - **This browser** — local documents, organized into virtual folders that live
   in your browser. Use **New file** / **New folder**, drag a file onto a folder
   to move it, or rename/delete from a row's **⋯** menu.
-- **Google Drive** — expand it to load your **`markdowns`** root folder (created
+- **Google Drive** — expand it to load your **`markdown_sudo-karan`** root folder (created
   on first use; rename it in [`config.js`](./config.js) → `driveFolderName`).
   Create subfolders, drag files between them, rename, and delete (deletes move
   the item to the Drive trash). New files are created directly in Drive.
@@ -139,9 +156,9 @@ files to Drive"**, which uploads them so they're reachable from anywhere you
 sign in. The first time you sign in on a browser that already has documents,
 they're adopted into your account automatically so nothing appears to vanish.
 
-Because the scope is `drive.file`, the app only ever sees the `markdowns`
+Because the scope is `drive.file`, the app only ever sees the `markdown_sudo-karan`
 subtree — specifically, the folders and files **it** creates or that you open
-through it. Files you add to `markdowns` manually from the Drive website won't
+through it. Files you add to that folder manually from the Drive website won't
 appear here (that would require a broader, Google-verified scope, which this app
 intentionally avoids).
 

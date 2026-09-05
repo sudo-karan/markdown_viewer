@@ -75,9 +75,20 @@ button { font-family: inherit; }
 
 .app {
   display: grid;
+  /* minmax(0, 1fr) pins the single column to the viewport. Without it the
+     implicit column sizes to max-content, so on a phone the chrome laid itself
+     out wider than the screen and — with body overflow hidden — the right-hand
+     controls (Sign in, the view modes) became unreachable rather than just
+     clipped. The min-width:0 below lets each row shrink for the same reason. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: var(--header-h) var(--toolbar-h) 1fr var(--status-h);
   height: 100vh;
+  max-width: 100vw;
 }
+.app-header,
+.toolbar,
+.workspace,
+.statusbar { min-width: 0; }
 
 /* ============================ Header ============================ */
 .app-header {
@@ -102,7 +113,7 @@ button { font-family: inherit; }
 
 .doc-title {
   flex: 0 1 320px;
-  min-width: 80px;
+  min-width: 0; /* must be able to shrink, or it pushes the actions off-screen */
   margin-left: 8px;
   padding: 5px 8px;
   background: transparent;
@@ -124,6 +135,7 @@ button { font-family: inherit; }
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0; /* Sign in must stay reachable on a phone */
 }
 
 .icon-btn {
@@ -183,8 +195,23 @@ button { font-family: inherit; }
   padding: 0 10px;
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
-  overflow-x: auto;
+  overflow: hidden;
 }
+/* Toolbar items keep their size; only the formatting strip scrolls, so Files
+   and the view modes stay pinned and reachable on a narrow screen. */
+.toolbar > * { flex-shrink: 0; }
+.toolbar-scroll {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.toolbar-scroll::-webkit-scrollbar { display: none; }
+.toolbar-scroll > * { flex-shrink: 0; }
 .toolbar-group { display: flex; align-items: center; gap: 2px; }
 .toolbar-sep {
   width: 1px;
@@ -882,4 +909,21 @@ kbd {
   .sidebar { position: absolute; z-index: 8; height: 100%; box-shadow: var(--shadow); }
   .app[data-view="split"] .editor-pane { display: none; }
   .app[data-view="split"] .pane-divider { display: none; }
+  /* Keep the whole status bar reachable instead of letting it overflow. */
+  .statusbar { overflow-x: auto; gap: 10px; }
+  .status-left, .status-right { flex-shrink: 0; }
+}
+
+/* Phones: give the header just enough room for the action buttons, and let the
+   toolbar scroll. Sign in stays on screen, which is what matters most here. */
+@media (max-width: 560px) {
+  .brand { display: none; }
+  .app-header { gap: 8px; padding: 0 8px; }
+  .doc-title { flex: 1 1 40px; margin-left: 0; font-size: 13px; }
+  .header-actions { gap: 2px; }
+  .header-actions .icon-btn { min-width: 28px; padding: 0 4px; }
+  .google-btn { padding: 0 8px; gap: 5px; }
+  .toolbar { padding: 0 6px; }
+  /* Word/read/cursor counters are the first thing worth losing on a phone. */
+  #stat-words, #stat-read, #cursor-pos { display: none; }
 }

@@ -27,6 +27,7 @@ let tokenExpiry = 0;
 let profile = null;
 let folderId = null;
 let folderName = "Markdown Studio";
+let legacyFolderNames = [];
 
 let gisPromise = null;
 function loadGis() {
@@ -44,9 +45,10 @@ function loadGis() {
   return gisPromise;
 }
 
-export function configure(id, driveFolderName) {
+export function configure(id, driveFolderName, previousFolderNames) {
   clientId = id ? id.trim() : null;
   if (driveFolderName) folderName = driveFolderName;
+  legacyFolderNames = Array.isArray(previousFolderNames) ? previousFolderNames : [];
   tokenClient = null; // force re-init if the id changed
 }
 
@@ -174,18 +176,39 @@ async function driveError(res, fallback) {
  * touches. Everything the app creates lives under this subtree, so with the
  * drive.file scope the app can never see the rest of the user's Drive.
  */
+/** Look for a folder with this exact name directly in My Drive. */
+async function findRootFolderNamed(name) {
+  const q = encodeURIComponent(
+    `mimeType='${FOLDER_MIME}' and name='${name.replace(/'/g, "\\'")}' and 'root' in parents and trashed=false`,
+  );
+  const res = await authFetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=1`,
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.files?.length ? data.files[0] : null;
+}
+
 async function ensureRootFolder() {
   if (folderId) return folderId;
-  const q = encodeURIComponent(
-    `mimeType='${FOLDER_MIME}' and name='${folderName.replace(/'/g, "\\'")}' and 'root' in parents and trashed=false`,
-  );
-  const found = await authFetch(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&pageSize=1`,
-  );
-  if (found.ok) {
-    const data = await found.json();
-    if (data.files?.length) {
-      folderId = data.files[0].id;
+  const found = await findRootFolderNamed(folderName);
+  if (found) {
+    folderId = found.id;
+    return folderId;
+  }
+  // The deployment's folder name can change (config.js driveFolderName). Adopt
+  // and rename a folder created under a previous name instead of silently
+  // starting an empty one and stranding the user's existing documents.
+  for (const legacy of legacyFolderNames) {
+    if (legacy === folderName) continue;
+    const old = await findRootFolderNamed(legacy);
+    if (old) {
+      folderId = old.id;
+      try {
+        await drive.rename(old.id, folderName);
+      } catch {
+        /* keep using the folder even if the rename is refused */
+      }
       return folderId;
     }
   }
