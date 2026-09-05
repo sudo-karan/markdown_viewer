@@ -409,20 +409,30 @@ function makeRow(o) {
       e.dataTransfer.effectAllowed = "move";
     });
   }
-  if (o.onDrop) {
+  // Folder rows accept both an in-app drag (a row, possibly from the *other*
+  // source) and files dragged in from the computer.
+  if (o.dropTarget) {
     row.addEventListener("dragover", (e) => {
       e.preventDefault();
+      e.dataTransfer.dropEffect = e.dataTransfer.types?.includes("Files") ? "copy" : "move";
       row.classList.add("drop-target");
     });
     row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
-    row.addEventListener("drop", (e) => {
+    row.addEventListener("drop", async (e) => {
       e.preventDefault();
+      e.stopPropagation(); // don't also hit the window-level import handler
       row.classList.remove("drop-target");
-      try {
-        o.onDrop(JSON.parse(e.dataTransfer.getData("text/plain")));
-      } catch {
-        /* ignore malformed drag */
+      if (e.dataTransfer?.files?.length) {
+        await importFilesInto(e.dataTransfer.files, o.dropTarget);
+        return;
       }
+      let dragData;
+      try {
+        dragData = JSON.parse(e.dataTransfer.getData("text/plain"));
+      } catch {
+        return; // not one of ours
+      }
+      await dropOnto(dragData, o.dropTarget);
     });
   }
 
@@ -474,7 +484,7 @@ function renderTree() {
     icon: DEVICE_ICON,
     name: "This browser",
     onToggle: () => toggleExpand(LOCAL_ROOT_KEY),
-    onDrop: (d) => moveLocal(d, ""),
+    dropTarget: { source: "local", path: "" },
     menu: () => [
       ["New file", () => newFileLocal("")],
       ["New folder", () => newFolderLocal("")],
@@ -490,7 +500,8 @@ function renderTree() {
     icon: CLOUD_ICON,
     name: "Google Drive",
     onToggle: toggleDriveRoot,
-    onDrop: state.driveRootId ? (d) => moveDrive(d, state.driveRootId) : undefined,
+    // Always droppable: the root folder is resolved (and created) on drop.
+    dropTarget: { source: "drive", folderId: state.driveRootId },
     menu: state.driveRootId
       ? () => [
           ["New file", () => newFileDrive(state.driveRootId)],
@@ -517,7 +528,7 @@ function renderLocalFolder(node, depth) {
       icon: FOLDER_ICON,
       name: sub.name,
       onToggle: () => toggleExpand(key),
-      onDrop: (d) => moveLocal(d, sub.path),
+      dropTarget: { source: "local", path: sub.path },
       menu: () => [
         ["New file", () => newFileLocal(sub.path)],
         ["New folder", () => newFolderLocal(sub.path)],
@@ -539,7 +550,7 @@ function renderLocalFolder(node, depth) {
       onActivate: () => {
         if (doc.id !== state.current?.id) loadDoc(doc);
       },
-      dragData: { source: "local", id: doc.id },
+      dragData: { source: "local", id: doc.id, name: doc.name },
       menu: () => [
         ["Rename", () => renameLocalDoc(doc)],
         ["Delete", () => deleteDoc(doc), "danger"],
@@ -565,7 +576,7 @@ function renderDriveChildren(folderId, depth) {
       icon: FOLDER_ICON,
       name: f.name,
       onToggle: () => toggleDriveFolder(f.id, key),
-      onDrop: (d) => moveDrive(d, f.id),
+      dropTarget: { source: "drive", folderId: f.id },
       menu: () => [
         ["New file", () => newFileDrive(f.id)],
         ["New folder", () => newFolderDrive(f.id)],
@@ -585,7 +596,7 @@ function renderDriveChildren(folderId, depth) {
       name: f.name,
       active: !!state.current?.driveId && state.current.driveId === f.id,
       onActivate: () => openDriveFile(f, folderId),
-      dragData: { source: "drive", id: f.id, parentId: folderId },
+      dragData: { source: "drive", id: f.id, parentId: folderId, name: f.name },
       menu: () => [
         ["Rename", () => renameDriveFile(f, folderId)],
         ["Delete", () => deleteDriveFile(f, folderId), "danger"],
@@ -742,6 +753,177 @@ function moveLocal(dragData, targetPath) {
   if (targetPath) setExpanded("L:" + targetPath, true);
   persist(doc);
   toast("Moved");
+}
+
+/* ---- crossing between "This browser" and Google Drive ----
+ * Dragging between the two roots used to be a silent no-op. A drag from this
+ * browser onto a Drive folder now uploads the document (a real move — it stops
+ * being browser-only and becomes reachable from the user's other devices); the
+ * reverse direction copies the file down without touching the Drive original,
+ * so a drag can never destroy the only copy of something.
+ */
+
+/** Resolve a Drive drop target, falling back to the app's root folder. */
+async function resolveDriveFolder(folderId) {
+  if (folderId) return folderId;
+  if (state.driveRootId) return state.driveRootId;
+  return (await google.drive.root()).id;
+}
+
+/** Remember a newly created Drive file in the cache so the UI shows it at once. */
+function cacheDriveFile(parentId, res) {
+  const c = state.driveCache[parentId];
+  if (c && c.loaded) {
+    c.files.push({
+      id: res.id,
+      name: res.name,
+      size: res.size,
+      createdTime: res.createdTime,
+      modifiedTime: res.modifiedTime,
+    });
+  }
+}
+
+/** Move a browser-only document into a Drive folder (upload + rebind). */
+async function moveLocalDocToDrive(dragData, targetFolderId) {
+  const existing = state.library.find((d) => d.id === dragData.id);
+  if (!existing) return;
+  if (existing.driveId) {
+    toast("That document is already in Drive");
+    return;
+  }
+  setSaveState("saving");
+  try {
+    await ensureSignedIn();
+    // Signing in can switch accounts, which reloads state.library into fresh
+    // objects — re-resolve rather than writing through a stale reference.
+    const doc = state.library.find((d) => d.id === dragData.id);
+    if (!doc) {
+      setSaveState("saved");
+      toast("That document isn't in the signed-in account", "error");
+      return;
+    }
+    const parent = await resolveDriveFolder(targetFolderId);
+    const res = await google.drive.create(ensureMdName(doc.name), doc.text || "", parent);
+    doc.driveId = res.id;
+    doc.driveName = res.name || doc.name;
+    doc.driveParentId = (res.parents && res.parents[0]) || parent;
+    doc.folder = ""; // it lives in Drive now, not in a local virtual folder
+    cacheDriveFile(parent, res);
+    setExpanded(DRIVE_ROOT_KEY, true);
+    if (parent !== state.driveRootId) setExpanded("D:" + parent, true);
+    persist(doc);
+    updateStorageLoc();
+    setSaveState("saved");
+    toast(`Moved “${doc.name}” to Drive`, "success");
+  } catch (e) {
+    setSaveState("error");
+    toast(e.message || "Could not move that file to Drive", "error");
+  }
+}
+
+/** Copy a Drive file into this browser. The Drive original is left alone. */
+async function copyDriveFileToLocal(dragData, targetPath) {
+  try {
+    const text = await google.drive.read(dragData.id);
+    const name = dragData.name || "Untitled.md";
+    const now = Date.now();
+    const doc = {
+      id: uid(), name, text, driveId: null,
+      folder: targetPath || "", created: now, updated: now,
+    };
+    state.library = upsertDoc(state.library, doc);
+    store.saveLibrary(state.library);
+    setExpanded(LOCAL_ROOT_KEY, true);
+    if (targetPath) setExpanded("L:" + targetPath, true);
+    renderTree();
+    renderFiles();
+    toast(`Copied “${name}” into this browser`, "success");
+  } catch (e) {
+    toast(e.message || "Could not copy that file from Drive", "error");
+  }
+}
+
+/** Route an in-app drag to the right handler, including across sources. */
+async function dropOnto(dragData, target) {
+  if (!dragData || !target) return;
+  const from = dragData.source;
+  if (from === "local" && target.source === "local") return moveLocal(dragData, target.path || "");
+  if (from === "drive" && target.source === "drive") {
+    return moveDrive(dragData, await resolveDriveFolder(target.folderId));
+  }
+  if (from === "local" && target.source === "drive") {
+    return moveLocalDocToDrive(dragData, target.folderId);
+  }
+  if (from === "drive" && target.source === "local") {
+    return copyDriveFileToLocal(dragData, target.path || "");
+  }
+}
+
+/* ---- importing files from the computer ---- */
+const IMPORTABLE = /\.(md|markdown|txt|mmd)$/i;
+
+/**
+ * Import dropped/picked files into a specific place — a local folder or a Drive
+ * folder. This is what makes "drag a file from my computer onto Google Drive"
+ * work; previously only the editor accepted a drop, and it always landed in the
+ * browser's local library.
+ * @param {FileList|File[]} fileList
+ * @param {{source:"local",path?:string}|{source:"drive",folderId?:string}} target
+ */
+async function importFilesInto(fileList, target) {
+  const all = [...(fileList || [])];
+  const files = all.filter((f) => IMPORTABLE.test(f.name));
+  const skipped = all.length - files.length;
+  if (!files.length) {
+    toast(all.length ? "Only .md / .markdown / .txt / .mmd files can be imported" : "Nothing to import", "error");
+    return;
+  }
+  let ok = 0;
+  let lastLocalDoc = null;
+  try {
+    if (target?.source === "drive") {
+      await ensureSignedIn();
+      const parent = await resolveDriveFolder(target.folderId);
+      for (const f of files) {
+        try {
+          const res = await google.drive.create(ensureMdName(f.name), await f.text(), parent);
+          cacheDriveFile(parent, res);
+          ok++;
+        } catch {
+          /* keep importing the rest; the count reports the truth */
+        }
+      }
+      setExpanded(DRIVE_ROOT_KEY, true);
+      if (parent !== state.driveRootId) setExpanded("D:" + parent, true);
+    } else {
+      const folder = target?.path || "";
+      for (const f of files) {
+        const now = Date.now();
+        lastLocalDoc = {
+          id: uid(), name: f.name, text: await f.text(), driveId: null,
+          folder, created: now, updated: now,
+        };
+        state.library = upsertDoc(state.library, lastLocalDoc);
+        ok++;
+      }
+      store.saveLibrary(state.library);
+      setExpanded(LOCAL_ROOT_KEY, true);
+      if (folder) setExpanded("L:" + folder, true);
+    }
+  } catch (e) {
+    toast(e.message || "Import failed", "error");
+    return;
+  }
+  renderTree();
+  renderFiles();
+  // Opening a single imported local file matches what the editor drop used to do.
+  if (ok === 1 && lastLocalDoc) loadDoc(lastLocalDoc);
+  const where = target?.source === "drive" ? "Drive" : "this browser";
+  toast(
+    `Imported ${ok} file${ok === 1 ? "" : "s"} into ${where}` + (skipped ? ` · skipped ${skipped}` : ""),
+    ok ? "success" : "error",
+  );
 }
 
 /* ---- Drive operations ---- */
@@ -1174,6 +1356,29 @@ function closeFiles() {
 function toggleFiles() {
   if (app.classList.contains("files-open")) closeFiles();
   else openFiles();
+}
+
+/**
+ * Where an import lands when it happens in the Files view: whichever folder is
+ * on screen. At the very root (the two sources) we default to this browser,
+ * and the toast says where the files went.
+ */
+function filesDropTarget() {
+  const here = filesHere();
+  if (!here) return { source: "local", path: "" };
+  return here.source === "drive"
+    ? { source: "drive", folderId: here.folderId }
+    : { source: "local", path: here.path };
+}
+
+/** Import… button in the Files view — picks files for the current folder. */
+function filesImport() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.accept = ".md,.markdown,.txt,.mmd,text/markdown,text/plain";
+  input.addEventListener("change", () => importFilesInto(input.files, filesDropTarget()));
+  input.click();
 }
 
 /** "New folder" inside whatever location the browser is showing. */
@@ -1743,18 +1948,12 @@ function openLocalFile() {
   input.click();
 }
 
+/** Files dropped on the editor land in this browser (multiple are accepted). */
 function handleDrop(e) {
-  const file = e.dataTransfer?.files?.[0];
-  if (!file) return;
+  if (!e.dataTransfer?.files?.length) return;
   e.preventDefault();
-  if (!/\.(md|markdown|txt|mmd)$/i.test(file.name)) {
-    toast("Drop a .md / .markdown / .txt file", "error");
-    return;
-  }
-  file.text().then((text) => {
-    newDoc(file.name, text);
-    toast(`Opened ${file.name}`, "success");
-  });
+  e.stopPropagation();
+  importFilesInto(e.dataTransfer.files, { source: "local", path: "" });
 }
 
 async function handlePaste(e) {
@@ -2053,6 +2252,34 @@ function wireEvents() {
   $("btn-files").addEventListener("click", toggleFiles);
   $("files-close").addEventListener("click", closeFiles);
   $("files-new-folder").addEventListener("click", filesNewFolder);
+  $("files-import").addEventListener("click", filesImport);
+
+  // Drop files from the computer anywhere in the Files view → current folder
+  // (including a Google Drive folder, which uploads them).
+  const filesView = $("files-view");
+  filesView.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    filesView.classList.add("drop-active");
+  });
+  filesView.addEventListener("dragleave", (e) => {
+    if (e.target === filesView) filesView.classList.remove("drop-active");
+  });
+  filesView.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    filesView.classList.remove("drop-active");
+    await importFilesInto(e.dataTransfer.files, filesDropTarget());
+  });
+
+  // A file dropped outside a drop zone would otherwise make the browser
+  // navigate away from the app (losing unsaved work). Swallow those.
+  for (const type of ["dragover", "drop"]) {
+    document.addEventListener(type, (e) => {
+      if (e.dataTransfer?.types?.includes("Files")) e.preventDefault();
+    });
+  }
   document.querySelectorAll(".files-table th[data-sort]").forEach((th) =>
     th.addEventListener("click", () => {
       const col = th.dataset.sort;

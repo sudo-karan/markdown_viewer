@@ -17,7 +17,13 @@ import DOMPurify from "https://esm.sh/dompurify@3.2.4";
 // highlight.js is loaded as a single-file global build (see index.html) rather
 // than via esm.sh, which would pull hundreds of per-language submodules.
 const hljs = window.hljs;
-import mermaid from "https://esm.sh/mermaid@11.4.1";
+// Mermaid comes from jsDelivr's *official npm dist*, not esm.sh. esm.sh rebuilds
+// packages and resolves their dependencies at caret ranges (dompurify@^3.2.1,
+// marked@^13.0.2, lodash-es@^4.17.21 …), so the module it serves is a different
+// artifact whose behaviour can drift underneath us — in practice it ignored our
+// htmlLabels:false and emitted <foreignObject> labels, which the SVG sanitizer
+// then stripped, leaving correctly-sized but completely empty nodes.
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
 
 /** Stable, GitHub-compatible heading slugs (used by the outline + anchor links). */
 export function slugify(str) {
@@ -208,6 +214,79 @@ function applyAlerts(container) {
   });
 }
 
+/*
+ * Label safety net.
+ *
+ * Mermaid can render node labels either as SVG <text> or as HTML inside an
+ * <foreignObject>. Only the first survives the SVG sanitizer — foreignObject
+ * content lives in the XHTML namespace and DOMPurify drops it in every
+ * configuration (verified in a real browser), which is what produced diagrams
+ * with correctly-sized but completely empty boxes.
+ *
+ * We ask for text mode (htmlLabels:false), but we do not *depend* on Mermaid
+ * honouring it: any foreignObject that still shows up is rewritten into real
+ * <text>/<tspan> here, before sanitizing. That makes visible labels a property
+ * of this pipeline rather than of whichever Mermaid build happens to load.
+ */
+const SVG_NS = "http://www.w3.org/2000/svg";
+const LABEL_LINE_HEIGHT = 17;
+
+function convertForeignObjectLabels(root) {
+  for (const fo of [...root.querySelectorAll("foreignObject")]) {
+    // <br> is the line separator Mermaid uses inside HTML labels.
+    const lines = fo.innerHTML
+      .split(/<br\s*\/?>/i)
+      .map((chunk) => {
+        const tmp = document.createElement("div");
+        tmp.innerHTML = chunk;
+        return (tmp.textContent || "").replace(/\s+/g, " ").trim();
+      })
+      .filter(Boolean);
+    if (!lines.length) {
+      fo.remove();
+      continue;
+    }
+    const x = parseFloat(fo.getAttribute("x") || "0");
+    const y = parseFloat(fo.getAttribute("y") || "0");
+    const w = parseFloat(fo.getAttribute("width") || "0");
+    const h = parseFloat(fo.getAttribute("height") || "0");
+    const cx = x + w / 2;
+    // Vertically centre the block of lines inside the label box.
+    const top = y + (h - (lines.length - 1) * LABEL_LINE_HEIGHT) / 2;
+
+    const text = document.createElementNS(SVG_NS, "text");
+    text.setAttribute("text-anchor", "middle");
+    text.setAttribute("dominant-baseline", "middle");
+    text.setAttribute("class", "nodeLabel");
+    text.setAttribute("x", String(cx));
+    text.setAttribute("y", String(top));
+    lines.forEach((line, i) => {
+      const tspan = document.createElementNS(SVG_NS, "tspan");
+      tspan.setAttribute("x", String(cx));
+      if (i) tspan.setAttribute("dy", String(LABEL_LINE_HEIGHT));
+      tspan.textContent = line;
+      text.appendChild(tspan);
+    });
+    fo.replaceWith(text);
+  }
+}
+
+/**
+ * Clean up a freshly rendered Mermaid SVG before it is sanitized.
+ * @param {string} svgString
+ * @returns {string}
+ */
+function normalizeMermaidSvg(svgString) {
+  // With htmlLabels off Mermaid double-escapes `&` in subgraph titles, so
+  // "A & B" would render as the literal text "A &amp; B".
+  const fixed = svgString.replace(/&amp;amp;/g, "&amp;");
+  if (!/foreignObject/i.test(fixed)) return fixed;
+  const holder = document.createElement("div");
+  holder.innerHTML = fixed;
+  convertForeignObjectLabels(holder);
+  return holder.innerHTML;
+}
+
 /** Parse a computed "rgb(r, g, b)" / "rgba(...)" colour into [r,g,b]. */
 function parseRgb(value) {
   const m = String(value).match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
@@ -280,10 +359,7 @@ export async function enhance(container, { dark }) {
       const src = code.textContent || "";
       try {
         const rendered = await mermaid.render(`mmd-${i}-${Math.floor(Math.random() * 1e9)}`, src);
-        // With htmlLabels off, Mermaid double-escapes `&` in subgraph titles, so
-        // "A & B" renders as the literal text "A &amp; B". Collapse the double
-        // entity back to a single one so the ampersand shows as a character.
-        const svg = rendered.svg.replace(/&amp;amp;/g, "&amp;");
+        const svg = normalizeMermaidSvg(rendered.svg);
         const fig = document.createElement("div");
         fig.className = "mermaid-figure";
         // Carry the fence's source line onto the figure so clicking the diagram
