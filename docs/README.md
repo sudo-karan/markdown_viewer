@@ -109,6 +109,19 @@ The sidebar shows one tree with two roots:
 Renaming or saving writes straight back to wherever the file lives — localStorage
 for local docs, the Drive API for Drive files.
 
+### Moving files between the two, and importing from your computer
+
+- **Drag across the roots.** Dragging a document from **This browser** onto a
+  Drive folder uploads it — a real move, so it becomes reachable from your other
+  devices. Dragging the other way (Drive → This browser) makes a **copy** and
+  leaves the Drive original alone, so a drag can never destroy your only copy.
+- **Drag files in from your computer.** Drop `.md` / `.markdown` / `.txt` /
+  `.mmd` files onto any folder in the tree, or anywhere in the **Files** view,
+  and they're imported into that folder — including a Google Drive folder, which
+  uploads them. Several files at once is fine; anything else is skipped with a
+  note. The **Import…** button in the Files view does the same for the folder
+  you're looking at.
+
 ### The Files view
 
 The **Files** button in the toolbar opens a full-width browser over both

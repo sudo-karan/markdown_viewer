@@ -474,6 +474,10 @@ button { font-family: inherit; }
 .files-bar-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .files-bar-actions .ghost-btn { flex: 0 0 auto; }
 
+/* Dragging files from the computer over the browser targets the open folder. */
+.files-view.drop-active { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.files-view.drop-active .files-table-wrap { background: var(--bg-hover); }
+
 .files-table-wrap { flex: 1; overflow: auto; }
 .files-table {
   width: 100%;
