@@ -208,6 +208,38 @@ function applyAlerts(container) {
   });
 }
 
+/** Parse a computed "rgb(r, g, b)" / "rgba(...)" colour into [r,g,b]. */
+function parseRgb(value) {
+  const m = String(value).match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+  return m ? [+m[1], +m[2], +m[3]] : null;
+}
+/** WCAG relative luminance, 0 (black) → 1 (white). */
+function luminance([r, g, b]) {
+  const f = (c) => {
+    c /= 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+}
+/**
+ * Mermaid colours label text for its own theme, not for per-node colours. A node
+ * given a light custom fill (`style X fill:#ffe0b2`) while the dark theme is
+ * active therefore gets near-invisible light-grey text. Repaint every label so it
+ * contrasts with the shape it actually sits on. Must run with the figure already
+ * in the document so getComputedStyle resolves the real fill.
+ * @param {HTMLElement} fig
+ */
+function fixDiagramContrast(fig) {
+  for (const group of fig.querySelectorAll("g.node, g.cluster")) {
+    const shape = group.querySelector("rect, polygon, circle, ellipse, path");
+    if (!shape) continue;
+    const rgb = parseRgb(getComputedStyle(shape).fill);
+    if (!rgb) continue; // fill:none / gradient → leave Mermaid's colour alone
+    const ink = luminance(rgb) > 0.45 ? "#1f2328" : "#e6edf3";
+    for (const t of group.querySelectorAll("text, tspan")) t.style.fill = ink;
+  }
+}
+
 let mermaidReady = false;
 function initMermaid(dark) {
   mermaid.initialize({
@@ -220,7 +252,9 @@ function initMermaid(dark) {
     // previously rendered as empty shapes. Text mode survives sanitization and
     // still honours <br/> line breaks in multi-line labels.
     htmlLabels: false,
-    flowchart: { htmlLabels: false },
+    // Extra room above/below a subgraph title: in text mode a long title wraps
+    // to two lines and would otherwise be clipped by the subgraph border.
+    flowchart: { htmlLabels: false, subGraphTitleMargin: { top: 8, bottom: 8 } },
     theme: dark ? "dark" : "default",
     fontFamily: "var(--font-sans)",
   });
@@ -262,6 +296,7 @@ export async function enhance(container, { dark }) {
         // content left to lose here.
         fig.innerHTML = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
         pre.replaceWith(fig);
+        fixDiagramContrast(fig); // after insertion, so computed fills resolve
       } catch {
         // Leave the original code block on parse errors.
       }
