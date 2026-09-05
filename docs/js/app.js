@@ -5,9 +5,11 @@
  * optional Google Drive sync (google.js). No framework, no build step — this is
  * plain ES modules so it can be served straight off GitHub Pages.
  */
-import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js";
-import { store, upsertDoc, removeDoc, uid } from "./storage.js";
-import * as google from "./google.js";
+// ?v= cache-buster: bump on every JS change (keep in sync with index.html's
+// script tag) so a deploy never leaves the browser on a stale module.
+import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260905";
+import { store, upsertDoc, removeDoc, uid } from "./storage.js?v=20260905";
+import * as google from "./google.js?v=20260905";
 import LZString from "https://esm.sh/lz-string@1.5.0";
 
 const CONFIG = window.MO_STUDIO_CONFIG || {};
@@ -857,6 +859,7 @@ function deleteDoc(doc) {
 function onEdit() {
   if (!state.current) return;
   state.current.text = editor.value;
+  invalidateLineOffsets(); // wrapped-line layout changed
   setSaveState("dirty");
   updateStats();
   scheduleRender();
@@ -1111,13 +1114,78 @@ const FORMATTERS = {
  */
 const previewPane = $("preview-pane");
 
-let editorLineH = 0;
-function lineHeightPx() {
-  if (editorLineH) return editorLineH;
-  const lh = parseFloat(getComputedStyle(editor).lineHeight);
-  const fs = parseFloat(getComputedStyle(editor).fontSize) || 14;
-  editorLineH = Number.isFinite(lh) && lh > 0 ? lh : fs * 1.7;
-  return editorLineH;
+// Wrap-aware mapping between the editor's scroll position and its source line.
+// A textarea wraps long lines, so scrollTop / lineHeight is NOT the source line
+// (the error grows as you scroll past wrapped lines). A hidden mirror div
+// reproduces the wrapped layout to get each line's true pixel offset; rebuilt
+// lazily whenever the text or the editor width changes.
+let editorMirror = null;
+let lineOffsets = null;
+let lineOffsetsKey = "";
+function buildLineOffsets() {
+  const cs = getComputedStyle(editor);
+  if (!editorMirror) {
+    editorMirror = document.createElement("div");
+    editorMirror.setAttribute("aria-hidden", "true");
+    Object.assign(editorMirror.style, {
+      position: "absolute",
+      visibility: "hidden",
+      left: "-9999px",
+      top: "0",
+      boxSizing: "border-box",
+      whiteSpace: "pre-wrap",
+      overflowWrap: "break-word",
+      wordBreak: "break-word",
+    });
+    document.body.appendChild(editorMirror);
+  }
+  const m = editorMirror;
+  m.style.width = editor.clientWidth + "px";
+  m.style.font = cs.font;
+  m.style.lineHeight = cs.lineHeight;
+  m.style.letterSpacing = cs.letterSpacing;
+  m.style.padding = cs.padding;
+  m.style.tabSize = cs.tabSize;
+  m.textContent = "";
+  const divs = editor.value.split("\n").map((ln) => {
+    const d = document.createElement("div");
+    d.textContent = ln === "" ? "​" : ln; // keep empty lines one row tall
+    m.appendChild(d);
+    return d;
+  });
+  const padTop = parseFloat(cs.paddingTop) || 0;
+  lineOffsets = divs.map((d) => d.offsetTop - padTop);
+  lineOffsetsKey = editor.value.length + ":" + editor.clientWidth;
+}
+function lineOffs() {
+  if (!lineOffsets || lineOffsetsKey !== editor.value.length + ":" + editor.clientWidth) buildLineOffsets();
+  return lineOffsets;
+}
+function invalidateLineOffsets() {
+  lineOffsets = null;
+}
+// Fractional source line at the top of the editor viewport.
+function editorTopLine() {
+  const offs = lineOffs();
+  const y = editor.scrollTop;
+  let lo = 0,
+    hi = offs.length - 1,
+    i = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (offs[mid] <= y) { i = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  const top = offs[i];
+  const next = i + 1 < offs.length ? offs[i + 1] : top + 1;
+  return i + (next > top ? Math.max(0, Math.min(1, (y - top) / (next - top))) : 0);
+}
+// Editor scrollTop that places a (fractional) source line at the viewport top.
+function lineToEditorTop(line) {
+  const offs = lineOffs();
+  const i = Math.max(0, Math.min(offs.length - 1, Math.floor(line)));
+  const top = offs[i];
+  const next = i + 1 < offs.length ? offs[i + 1] : top;
+  return top + (line - i) * (next - top);
 }
 
 // Preview anchors as {line, top}, where `top` is the element's offset from the
@@ -1144,7 +1212,7 @@ function withScrollGuard(fn) {
 // Editor scrolled → move the preview so the same source line sits at the top.
 function syncPreviewToEditor() {
   if (state.syncingScroll || state.view !== "split") return;
-  const topLine = editor.scrollTop / lineHeightPx();
+  const topLine = editorTopLine();
   const anchors = previewAnchors();
   let target;
   if (anchors.length) {
@@ -1180,7 +1248,7 @@ function syncEditorToPreview() {
     const ratio = previewPane.scrollTop / Math.max(1, previewPane.scrollHeight - previewPane.clientHeight);
     line = ratio * editor.value.split("\n").length;
   }
-  withScrollGuard(() => (editor.scrollTop = line * lineHeightPx()));
+  withScrollGuard(() => (editor.scrollTop = lineToEditorTop(line)));
 }
 
 // Clicking a preview block selects and reveals its source line in the editor.
@@ -1198,7 +1266,7 @@ function jumpToSource(e) {
   editor.focus();
   editor.setSelectionRange(start, end);
   withScrollGuard(() => {
-    editor.scrollTop = Math.max(0, line * lineHeightPx() - editor.clientHeight / 3);
+    editor.scrollTop = Math.max(0, lineToEditorTop(line) - editor.clientHeight / 3);
   });
   updateCursor();
   const pane = $("editor-pane");
@@ -1287,6 +1355,20 @@ function downloadMd() {
 // Export to PDF via the browser's print dialog (where paper size, margins, and
 // "Save as PDF" live). The `@media print` stylesheet isolates the rendered
 // preview, so no popup window is needed.
+// While printing, force the light GitHub/hljs stylesheets so dark-theme docs
+// (tables, code) don't come out dark-on-dark; restore the real theme afterward.
+// Wired to before/afterprint, so it also covers the browser's own Ctrl/Cmd+P.
+function setPrintLight(on) {
+  const set = (id, off) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = off;
+  };
+  set("gh-md-dark", on ? true : !state.dark);
+  set("gh-md-light", on ? false : state.dark);
+  set("hljs-dark", on ? true : !state.dark);
+  set("hljs-light", on ? false : state.dark);
+}
+
 async function printPreview() {
   closeModals();
   // Make sure the preview reflects the latest keystrokes before the dialog opens.
@@ -1412,10 +1494,14 @@ function showTip(e) {
   tipEl.classList.add("show");
   const r = el.getBoundingClientRect();
   const tw = tipEl.offsetWidth;
+  const th = tipEl.offsetHeight;
   let left = r.left + r.width / 2 - tw / 2;
   left = Math.max(6, Math.min(left, window.innerWidth - tw - 6));
+  // Prefer below the control, but flip above when there's no room (status bar).
+  const below = r.bottom + 6;
+  const top = below + th > window.innerHeight - 4 ? r.top - th - 6 : below;
   tipEl.style.left = left + "px";
-  tipEl.style.top = r.bottom + 6 + "px";
+  tipEl.style.top = Math.max(4, top) + "px";
 }
 function hideTip() {
   tipEl?.classList.remove("show");
@@ -1426,7 +1512,8 @@ function setupFastTooltips() {
   tipEl.setAttribute("role", "tooltip");
   document.body.appendChild(tipEl);
   const els = document.querySelectorAll(
-    ".toolbar [title], .header-actions .icon-btn[title], .side-actions [title]",
+    "#sidebar-toggle[title], .toolbar [title], .header-actions .icon-btn[title]," +
+      " .side-actions [title], .statusbar .link-btn[title]",
   );
   els.forEach((el) => {
     const t = el.getAttribute("title");
@@ -1510,6 +1597,8 @@ function wireEvents() {
   $("btn-new-folder").addEventListener("click", () => newFolderLocal(""));
   $("btn-download").addEventListener("click", downloadMd);
   $("btn-pdf").addEventListener("click", printPreview);
+  window.addEventListener("beforeprint", () => setPrintLight(true));
+  window.addEventListener("afterprint", () => setPrintLight(false));
   $("btn-share").addEventListener("click", shareLink);
   $("btn-export").addEventListener("click", () => openModal("export-modal"));
   $("btn-google").addEventListener("click", onGoogleButton);
@@ -1536,6 +1625,9 @@ function wireEvents() {
   });
 
   window.addEventListener("keydown", onShortcut);
+  // Editor width changes (window resize, divider drag) change line wrapping,
+  // so the cached per-line offsets used for scroll sync must be rebuilt.
+  window.addEventListener("resize", invalidateLineOffsets);
 }
 
 function onShortcut(e) {

@@ -740,17 +740,10 @@ kbd {
     margin: 0 !important;
     padding: 0 !important;
   }
-  .markdown-body {
-    color: #1f2328 !important;
-    background: #fff !important;
-  }
-  .markdown-body a { color: #0969da !important; }
-  .markdown-body pre,
-  .markdown-body code,
-  .markdown-body tt {
-    background: #f6f8fa !important;
-    color: #1f2328 !important;
-  }
+  /* Colours come from the light GitHub/hljs sheets that before-print enables
+     (see setPrintLight), which keeps tables and syntax highlighting legible.
+     This is only a fallback base colour for browsers without beforeprint. */
+  .markdown-body { color: #1f2328; }
   .markdown-body pre,
   .markdown-body table,
   .markdown-body blockquote,

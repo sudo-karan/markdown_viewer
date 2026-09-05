@@ -114,6 +114,20 @@ stampSourceLines([
   "hr",
 ]);
 
+// Code fences (including Mermaid) build their own markup via highlight(), so the
+// generic stamper can't reach them. Wrap the fence renderer to inject the source
+// line onto its <pre>, so clicking a code block or diagram jumps to its source
+// and scroll-sync has an anchor at large code blocks.
+const defaultFence =
+  md.renderer.rules.fence ||
+  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+  const out = defaultFence(tokens, idx, options, env, self);
+  const t = tokens[idx];
+  if (t.map) return out.replace(/^(\s*<pre\b)/i, `$1 data-source-line="${t.map[0]}"`);
+  return out;
+};
+
 const ALERT_TYPES = {
   NOTE: "note",
   TIP: "tip",
@@ -231,9 +245,17 @@ export async function enhance(container, { dark }) {
       const pre = code.closest("pre") || code;
       const src = code.textContent || "";
       try {
-        const { svg } = await mermaid.render(`mmd-${i}-${Math.floor(Math.random() * 1e9)}`, src);
+        const rendered = await mermaid.render(`mmd-${i}-${Math.floor(Math.random() * 1e9)}`, src);
+        // With htmlLabels off, Mermaid double-escapes `&` in subgraph titles, so
+        // "A & B" renders as the literal text "A &amp; B". Collapse the double
+        // entity back to a single one so the ampersand shows as a character.
+        const svg = rendered.svg.replace(/&amp;amp;/g, "&amp;");
         const fig = document.createElement("div");
         fig.className = "mermaid-figure";
+        // Carry the fence's source line onto the figure so clicking the diagram
+        // jumps back to its Markdown source.
+        const srcLine = pre.getAttribute && pre.getAttribute("data-source-line");
+        if (srcLine) fig.setAttribute("data-source-line", srcLine);
         // Defense-in-depth second pass (Mermaid already sanitizes in strict mode).
         // The SVG profile keeps <text>/<tspan> label text and the embedded <style>
         // that colours the diagram; with htmlLabels off there is no foreignObject

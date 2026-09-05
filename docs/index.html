@@ -287,6 +287,9 @@
         }, 10000);
       });
     </script>
-    <script type="module" src="./js/app.js"></script>
+    <!-- ?v= cache-buster: bump on every JS change so GitHub Pages / the browser
+         never serve a stale module after a deploy. Keep in sync with the ?v= on
+         the imports inside app.js. -->
+    <script type="module" src="./js/app.js?v=20260905"></script>
   </body>
 </html>
