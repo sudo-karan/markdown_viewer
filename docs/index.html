@@ -119,6 +119,12 @@
 
         <div class="toolbar-spacer"></div>
 
+        <button id="btn-files" class="ghost-btn files-btn" title="Browse all files with sizes and dates" aria-label="Browse files">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"></path></svg>
+          Files
+        </button>
+        <span class="toolbar-sep"></span>
+
         <div class="toolbar-group view-modes" role="group" aria-label="View mode">
           <button class="mode-btn" data-view="edit" title="Editor only">Edit</button>
           <button class="mode-btn is-active" data-view="split" title="Split view">Split</button>
@@ -167,6 +173,31 @@
         <section class="pane preview-pane" id="preview-pane">
           <article id="preview" class="markdown-body"></article>
         </section>
+
+        <!-- Details / file browser (spans the workspace when open) -->
+        <section class="files-view" id="files-view" hidden aria-label="File browser">
+          <div class="files-bar">
+            <nav id="files-crumbs" class="files-crumbs" aria-label="Breadcrumb"></nav>
+            <div class="files-bar-actions">
+              <button id="files-new-folder" class="ghost-btn">New folder</button>
+              <button id="files-close" class="ghost-btn">Close</button>
+            </div>
+          </div>
+          <div class="files-table-wrap">
+            <table class="files-table">
+              <thead>
+                <tr>
+                  <th data-sort="name" scope="col">Name</th>
+                  <th data-sort="size" scope="col">Size</th>
+                  <th data-sort="created" scope="col">Created</th>
+                  <th data-sort="modified" scope="col">Modified</th>
+                  <th scope="col"><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="files-rows"></tbody>
+            </table>
+          </div>
+        </section>
       </div>
 
       <!-- ============================ Status bar ============================ -->
@@ -203,7 +234,9 @@
           <span class="field-label">Google OAuth Client ID</span>
           <input id="set-client-id" class="text-input" placeholder="1234567890-abc123.apps.googleusercontent.com" spellcheck="false" />
           <span class="field-hint">
-            Needed only for Google Drive sync. A Client ID is public and safe to share.
+            Set once per site (in <code>config.js</code>) to turn on accounts: everyone then just
+            clicks <strong>Sign in with Google</strong> and gets their own documents, in their own
+            Drive, on every device — no keys to share. A Client ID is public and safe to commit.
             <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Create one →</a>
             See the README for the 2-minute setup.
           </span>
@@ -260,6 +293,8 @@
           <li>Syntax highlighting, Mermaid diagrams, and KaTeX math (<code>$…$</code>, <code>$$…$$</code>)</li>
           <li>Live split preview with synced scrolling; click the preview to jump to its source</li>
           <li>Local-first: autosaves to your browser; open/save files from disk</li>
+          <li>Sign in with Google for your own documents on every device; several people can share one browser</li>
+          <li><strong>Files</strong> view: folders with size, created and modified dates, sortable</li>
           <li>Google Drive sync using the least-privilege <code>drive.file</code> scope</li>
           <li>Paste an image to embed it, and share a doc as a self-contained link</li>
         </ul>
@@ -290,6 +325,6 @@
     <!-- ?v= cache-buster: bump on every JS change so GitHub Pages / the browser
          never serve a stale module after a deploy. Keep in sync with the ?v= on
          the imports inside app.js. -->
-    <script type="module" src="./js/app.js?v=20260905"></script>
+    <script type="module" src="./js/app.js?v=20260906"></script>
   </body>
 </html>

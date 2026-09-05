@@ -7,9 +7,9 @@
  */
 // ?v= cache-buster: bump on every JS change (keep in sync with index.html's
 // script tag) so a deploy never leaves the browser on a stale module.
-import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260905";
-import { store, upsertDoc, removeDoc, uid } from "./storage.js?v=20260905";
-import * as google from "./google.js?v=20260905";
+import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260906";
+import { store, upsertDoc, removeDoc, uid, setAccount } from "./storage.js?v=20260906";
+import * as google from "./google.js?v=20260906";
 import LZString from "https://esm.sh/lz-string@1.5.0";
 
 const CONFIG = window.MO_STUDIO_CONFIG || {};
@@ -248,11 +248,45 @@ function loadDoc(doc) {
 }
 
 function newDoc(name = "Untitled.md", text = "", folder = "") {
-  const doc = { id: uid(), name, text, driveId: null, folder, updated: Date.now() };
+  const now = Date.now();
+  const doc = { id: uid(), name, text, driveId: null, folder, created: now, updated: now };
   state.library = upsertDoc(state.library, doc);
   store.saveLibrary(state.library);
   loadDoc(doc);
   return doc;
+}
+
+/* ------------------------------------------------------------------ file metadata */
+/** UTF-8 byte length of a document's text (what it costs on disk / in Drive). */
+function docBytes(text) {
+  return new TextEncoder().encode(text || "").length;
+}
+function fmtBytes(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+function fmtDate(value) {
+  if (!value) return "—";
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return "—";
+  return (
+    d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) +
+    " " +
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+  );
+}
+/** Documents created before metadata was tracked have no `created` stamp. */
+function backfillDocMeta(lib) {
+  let changed = false;
+  for (const d of lib) {
+    if (!d.created) {
+      d.created = d.updated || Date.now();
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 /* ============================ Unified file tree ============================
@@ -568,7 +602,10 @@ async function ensureDriveReady() {
     openModal("settings-modal");
     return false;
   }
-  if (!google.isSignedIn()) await google.signIn();
+  if (!google.isSignedIn() || !google.getAccountId()) {
+    await google.signIn();
+    await onSignedIn(); // signing in here also switches accounts
+  }
   refreshGoogleUI();
   if (!state.driveRootId) {
     const root = await google.drive.root();
@@ -855,6 +892,303 @@ function deleteDoc(doc) {
   toast("Document deleted");
 }
 
+/* ============================ File browser ============================
+ * A full-width "details" view over the same two sources as the sidebar tree,
+ * with real folder navigation and sortable Name / Size / Created / Modified
+ * columns. The tree stays for quick switching; this is for actually managing
+ * files. Local sizes are computed from the document text; Drive supplies its
+ * own size/createdTime/modifiedTime.
+ * ==================================================================== */
+const filesState = {
+  trail: [], // breadcrumb: [{ name, source, path, folderId }]
+  sort: "name",
+  dir: 1,
+};
+const filesHere = () => filesState.trail[filesState.trail.length - 1] || null;
+
+/**
+ * Roll a local folder's contents up into the numbers the details table shows:
+ * total bytes, earliest creation and latest edit across everything inside it.
+ * Virtual folders have no timestamps of their own, so this is what makes the
+ * Created/Modified columns meaningful for them.
+ */
+function aggregateLocalFolder(node) {
+  let bytes = 0;
+  let created = Infinity;
+  let modified = 0;
+  const walk = (n) => {
+    for (const d of n.files) {
+      bytes += docBytes(d.text);
+      if (d.created) created = Math.min(created, d.created);
+      if (d.updated) modified = Math.max(modified, d.updated);
+    }
+    for (const sub of n.folders.values()) walk(sub);
+  };
+  walk(node);
+  return { bytes, created: created === Infinity ? null : created, modified: modified || null };
+}
+
+/** Walk the local virtual-folder tree down to `path`. */
+function localNodeAt(path) {
+  let node = buildLocalTree();
+  for (const seg of (path || "").split("/").filter(Boolean)) {
+    node = node.folders.get(seg);
+    if (!node) return null;
+  }
+  return node;
+}
+
+/** Rows for the current location, as a source-agnostic shape. */
+async function collectFileRows() {
+  const here = filesHere();
+
+  // Root: the two sources themselves.
+  if (!here) {
+    return [
+      { kind: "folder", name: "This browser", icon: DEVICE_ICON, nav: { name: "This browser", source: "local", path: "" } },
+      { kind: "folder", name: "Google Drive", icon: CLOUD_ICON, nav: { name: "Google Drive", source: "drive", folderId: null } },
+    ];
+  }
+
+  if (here.source === "local") {
+    const node = localNodeAt(here.path);
+    if (!node) return [];
+    const rows = [];
+    for (const sub of node.folders.values()) {
+      const agg = aggregateLocalFolder(sub);
+      rows.push({
+        kind: "folder", name: sub.name, icon: FOLDER_ICON, source: "local", path: sub.path,
+        size: agg.bytes, created: agg.created, modified: agg.modified,
+        nav: { name: sub.name, source: "local", path: sub.path },
+        menu: () => [
+          ["Rename", () => { renameLocalFolder(sub.path); renderFiles(); }],
+          ["Delete", () => { deleteLocalFolder(sub.path); renderFiles(); }, "danger"],
+        ],
+      });
+    }
+    for (const doc of node.files) {
+      rows.push({
+        kind: "file", name: doc.name, icon: FILE_ICON, source: "local",
+        size: docBytes(doc.text), created: doc.created, modified: doc.updated,
+        open: () => { loadDoc(doc); closeFiles(); },
+        menu: () => [
+          ["Rename", () => { renameLocalDoc(doc); renderFiles(); }],
+          ["Delete", () => { deleteDoc(doc); renderFiles(); }, "danger"],
+        ],
+      });
+    }
+    return rows;
+  }
+
+  // Drive: make sure this folder is loaded, then read the cache.
+  if (!google.isConfigured()) {
+    return [{ kind: "note", name: "Google isn't set up for this site yet — add a Client ID in Settings." }];
+  }
+  if (!(await ensureDriveReady())) return [];
+  const folderId = here.folderId || state.driveRootId;
+  if (!here.folderId) here.folderId = folderId;
+  await loadDriveFolder(folderId);
+  const c = state.driveCache[folderId];
+  if (!c) return [];
+  if (c.error) return [{ kind: "error", name: c.error }];
+  const rows = [];
+  for (const f of c.folders) {
+    rows.push({
+      kind: "folder", name: f.name, icon: FOLDER_ICON, source: "drive",
+      created: f.createdTime, modified: f.modifiedTime,
+      nav: { name: f.name, source: "drive", folderId: f.id },
+      menu: () => [
+        ["Rename", async () => { await renameDriveFolder(f); renderFiles(); }],
+        ["Delete", async () => { await deleteDriveFolder(f, folderId); renderFiles(); }, "danger"],
+      ],
+    });
+  }
+  for (const f of c.files) {
+    rows.push({
+      kind: "file", name: f.name, icon: FILE_ICON, source: "drive",
+      size: f.size != null ? Number(f.size) : null,
+      created: f.createdTime, modified: f.modifiedTime,
+      open: async () => { await openDriveFile(f, folderId); closeFiles(); },
+      menu: () => [
+        ["Rename", async () => { await renameDriveFile(f, folderId); renderFiles(); }],
+        ["Delete", async () => { await deleteDriveFile(f, folderId); renderFiles(); }, "danger"],
+      ],
+    });
+  }
+  return rows;
+}
+
+function sortFileRows(rows) {
+  const { sort, dir } = filesState;
+  const val = (r) => {
+    if (sort === "size") return r.size ?? -1;
+    if (sort === "created") return r.created ? new Date(r.created).getTime() : 0;
+    if (sort === "modified") return r.modified ? new Date(r.modified).getTime() : 0;
+    return String(r.name || "").toLowerCase();
+  };
+  return rows.slice().sort((a, b) => {
+    // Folders always lead, regardless of the active column.
+    if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+    const x = val(a);
+    const y = val(b);
+    if (typeof x === "string") return dir * x.localeCompare(y);
+    return dir * (x - y);
+  });
+}
+
+function renderFilesCrumbs() {
+  const nav = $("files-crumbs");
+  nav.innerHTML = "";
+  const add = (label, index) => {
+    const b = document.createElement("button");
+    b.className = "crumb";
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      filesState.trail = filesState.trail.slice(0, index);
+      renderFiles();
+    });
+    nav.appendChild(b);
+  };
+  add("All files", 0);
+  filesState.trail.forEach((t, i) => {
+    const sep = document.createElement("span");
+    sep.className = "crumb-sep";
+    sep.textContent = "›";
+    nav.appendChild(sep);
+    add(t.name, i + 1);
+  });
+}
+
+async function renderFiles() {
+  if (!app.classList.contains("files-open")) return;
+  renderFilesCrumbs();
+  const body = $("files-rows");
+  body.innerHTML = `<tr><td colspan="5" class="files-empty">Loading…</td></tr>`;
+  let rows;
+  try {
+    rows = await collectFileRows();
+  } catch (e) {
+    body.innerHTML = "";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="5" class="files-empty"></td>`;
+    tr.querySelector("td").textContent = e.message || "Could not list this folder.";
+    body.appendChild(tr);
+    return;
+  }
+  body.innerHTML = "";
+  document.querySelectorAll(".files-table th[data-sort]").forEach((th) => {
+    th.classList.toggle("sorted", th.dataset.sort === filesState.sort);
+    th.dataset.dir = th.dataset.sort === filesState.sort ? (filesState.dir > 0 ? "asc" : "desc") : "";
+  });
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="5" class="files-empty">This folder is empty.</td></tr>`;
+    return;
+  }
+  if (rows.length === 1 && (rows[0].kind === "note" || rows[0].kind === "error")) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "files-empty";
+    td.textContent = rows[0].name;
+    tr.appendChild(td);
+    body.appendChild(tr);
+    return;
+  }
+  // At the root the two sources keep their natural order (This browser first,
+  // matching the sidebar); inside a folder the chosen column sorts.
+  const ordered = filesHere() ? sortFileRows(rows) : rows;
+  for (const r of ordered) {
+    const tr = document.createElement("tr");
+    tr.className = "files-row " + r.kind;
+
+    const nameCell = document.createElement("td");
+    nameCell.className = "files-name";
+    const ic = document.createElement("span");
+    ic.className = "files-icon";
+    ic.innerHTML = r.icon || FILE_ICON;
+    const label = document.createElement("span");
+    label.className = "files-label";
+    label.textContent = r.name;
+    nameCell.append(ic, label);
+    tr.appendChild(nameCell);
+
+    const cell = (text, cls) => {
+      const td = document.createElement("td");
+      if (cls) td.className = cls;
+      td.textContent = text;
+      tr.appendChild(td);
+    };
+    // Drive folders report no size; local folders roll their contents up.
+    cell(r.size != null ? fmtBytes(r.size) : "—", "files-size");
+    cell(fmtDate(r.created), "files-date");
+    cell(fmtDate(r.modified), "files-date");
+
+    const actions = document.createElement("td");
+    actions.className = "files-actions-cell";
+    if (r.menu) {
+      const kb = document.createElement("button");
+      kb.className = "tree-kebab";
+      kb.textContent = "⋯";
+      kb.title = "Actions";
+      kb.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const box = kb.getBoundingClientRect();
+        openContextMenu(box.left, box.bottom + 2, r.menu());
+      });
+      actions.appendChild(kb);
+    }
+    tr.appendChild(actions);
+
+    if (r.nav || r.open) {
+      tr.tabIndex = 0;
+      const go = () => {
+        if (r.nav) {
+          filesState.trail = [...filesState.trail, r.nav];
+          renderFiles();
+        } else r.open();
+      };
+      tr.addEventListener("click", (e) => {
+        if (e.target.closest(".tree-kebab")) return;
+        go();
+      });
+      tr.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          go();
+        }
+      });
+    }
+    body.appendChild(tr);
+  }
+}
+
+function openFiles() {
+  app.classList.add("files-open");
+  $("files-view").hidden = false;
+  renderFiles();
+}
+function closeFiles() {
+  app.classList.remove("files-open");
+  $("files-view").hidden = true;
+}
+function toggleFiles() {
+  if (app.classList.contains("files-open")) closeFiles();
+  else openFiles();
+}
+
+/** "New folder" inside whatever location the browser is showing. */
+async function filesNewFolder() {
+  const here = filesHere();
+  if (!here) return toast("Open This browser or Google Drive first");
+  if (here.source === "local") {
+    newFolderLocal(here.path);
+    renderFiles();
+  } else {
+    await newFolderDrive(here.folderId || state.driveRootId);
+    renderFiles();
+  }
+}
+
 /* ------------------------------------------------------------------ autosave on edit */
 function onEdit() {
   if (!state.current) return;
@@ -975,6 +1309,115 @@ function refreshGoogleUI() {
   }
 }
 
+/* ============================ Accounts ============================
+ * Signing in with Google IS the account system: there is no backend, no
+ * password to store and no key for the user to paste. The deployment ships one
+ * public OAuth Client ID (config.js) and each person signs in with their own
+ * Google account, which gives them:
+ *   - their own documents, in their own Drive, on every device they sign in on;
+ *   - isolation from anyone else sharing this browser, because the account id
+ *     namespaces local storage (see storage.js setAccount).
+ * ================================================================== */
+
+/** Re-point the app at the current storage namespace and rebuild the UI. */
+function reloadForAccount() {
+  state.settings = store.loadSettings();
+  state.library = store.loadLibrary();
+  if (backfillDocMeta(state.library)) store.saveLibrary(state.library);
+
+  // Drive ids belong to whoever was signed in before — never reuse them.
+  state.driveRootId = null;
+  state.driveCache = {};
+
+  if (!state.settings.expanded) state.settings.expanded = { [LOCAL_ROOT_KEY]: true };
+  for (const k of Object.keys(state.settings.expanded)) {
+    if (k === DRIVE_ROOT_KEY || k.startsWith("D:")) delete state.settings.expanded[k];
+  }
+
+  if (state.settings.theme) applyTheme(state.settings.theme === "dark");
+  setView(state.settings.view || state.view);
+  const collapsed = !!state.settings.sidebarCollapsed;
+  app.classList.toggle("sidebar-collapsed", collapsed);
+  $("sidebar-toggle").setAttribute("aria-expanded", String(!collapsed));
+
+  const currentId = store.getCurrentId();
+  const doc = state.library.find((d) => d.id === currentId) || state.library[0];
+  if (doc) loadDoc(doc);
+  else newDoc("Welcome.md", SAMPLE);
+  renderTree();
+}
+
+/** Runs after every successful Google sign-in. */
+async function onSignedIn() {
+  const id = google.getAccountId();
+  refreshGoogleUI();
+  if (!id) return; // token but no profile — stay in the signed-out namespace
+  const anonLib = store.loadLibraryOf("anon");
+  setAccount(id);
+  if (store.loadLibrary().length === 0 && anonLib.length) {
+    // First sign-in on this browser: adopt the signed-out library so existing
+    // work follows the user into their account instead of seeming to vanish.
+    store.saveLibrary(anonLib.map((d) => ({ ...d })));
+    toast(`Added ${anonLib.length} document${anonLib.length === 1 ? "" : "s"} from this browser to your account`);
+  }
+  reloadForAccount();
+  refreshGoogleUI();
+}
+
+/** Sign in (if needed) and switch to that account's documents. */
+async function ensureSignedIn() {
+  if (google.isSignedIn() && google.getAccountId()) return true;
+  await google.signIn();
+  await onSignedIn();
+  return true;
+}
+
+/**
+ * Upload every document that currently exists only in this browser to the
+ * signed-in user's Drive — this is what makes "saved locally" reachable from
+ * their other devices.
+ */
+async function syncLocalDocsToDrive() {
+  if (!google.isConfigured()) {
+    toast("Google isn't configured for this site yet.", "error");
+    openModal("settings-modal");
+    return;
+  }
+  const pending = state.library.filter((d) => !d.driveId);
+  if (!pending.length) {
+    toast("Every document is already in your Drive", "success");
+    return;
+  }
+  setSaveState("saving");
+  let ok = 0;
+  try {
+    await ensureSignedIn();
+    const root = await google.drive.root();
+    for (const doc of pending) {
+      try {
+        const res = await google.drive.create(ensureMdName(doc.name), doc.text || "", root.id);
+        doc.driveId = res.id;
+        doc.driveName = res.name || doc.name;
+        doc.driveParentId = (res.parents && res.parents[0]) || root.id;
+        ok++;
+      } catch {
+        /* one bad file shouldn't abort the rest; the count reports the truth */
+      }
+    }
+    store.saveLibrary(state.library);
+    state.driveCache = {};
+    renderTree();
+    setSaveState(ok === pending.length ? "saved" : "error");
+    toast(
+      `Synced ${ok} of ${pending.length} document${pending.length === 1 ? "" : "s"} to Drive`,
+      ok === pending.length ? "success" : "error",
+    );
+  } catch (e) {
+    setSaveState("error");
+    toast(e.message || "Could not sync to Drive", "error");
+  }
+}
+
 /* Small popover menu for signed-in Google actions. */
 let menuEl = null;
 function toggleGoogleMenu() {
@@ -990,8 +1433,15 @@ function toggleGoogleMenu() {
   const rect = googleBtn.getBoundingClientRect();
   menuEl.style.top = rect.bottom + 6 + "px";
   menuEl.style.left = Math.max(8, rect.right - 200) + "px";
+  const localOnly = state.library.filter((d) => !d.driveId).length;
   const actions = [
     ["Save current doc to Drive", () => saveToDrive()],
+    [
+      localOnly
+        ? `Sync ${localOnly} browser-only file${localOnly === 1 ? "" : "s"} to Drive`
+        : "All files are synced to Drive",
+      () => (localOnly ? syncLocalDocsToDrive() : toast("Every document is already in your Drive", "success")),
+    ],
     ["Show Drive files", () => {
       if (!isExpanded(DRIVE_ROOT_KEY)) toggleDriveRoot();
     }],
@@ -1034,8 +1484,9 @@ async function onGoogleButton() {
   }
   try {
     await google.signIn();
-    refreshGoogleUI();
-    toast("Signed in to Google", "success");
+    await onSignedIn(); // switch to this account's documents
+    const p = google.getProfile();
+    toast(p?.email ? `Signed in as ${p.email}` : "Signed in to Google", "success");
   } catch (e) {
     toast(e.message || "Google sign-in failed", "error");
   }
@@ -1043,8 +1494,10 @@ async function onGoogleButton() {
 
 function doSignOut() {
   google.signOut();
+  setAccount(null); // back to this browser's signed-out library
+  reloadForAccount();
   refreshGoogleUI();
-  toast("Signed out");
+  toast("Signed out — showing this browser's documents");
 }
 
 /* ------------------------------------------------------------------ editor formatting */
@@ -1597,6 +2050,18 @@ function wireEvents() {
   $("btn-new-folder").addEventListener("click", () => newFolderLocal(""));
   $("btn-download").addEventListener("click", downloadMd);
   $("btn-pdf").addEventListener("click", printPreview);
+  $("btn-files").addEventListener("click", toggleFiles);
+  $("files-close").addEventListener("click", closeFiles);
+  $("files-new-folder").addEventListener("click", filesNewFolder);
+  document.querySelectorAll(".files-table th[data-sort]").forEach((th) =>
+    th.addEventListener("click", () => {
+      const col = th.dataset.sort;
+      // Same column toggles direction; a new column starts ascending.
+      filesState.dir = filesState.sort === col ? -filesState.dir : 1;
+      filesState.sort = col;
+      renderFiles();
+    }),
+  );
   window.addEventListener("beforeprint", () => setPrintLight(true));
   window.addEventListener("afterprint", () => setPrintLight(false));
   $("btn-share").addEventListener("click", shareLink);
@@ -1632,7 +2097,10 @@ function wireEvents() {
 
 function onShortcut(e) {
   const mod = e.metaKey || e.ctrlKey;
-  if (e.key === "Escape") return closeModals();
+  if (e.key === "Escape") {
+    if (app.classList.contains("files-open")) closeFiles();
+    return closeModals();
+  }
   if (!mod) return;
   const k = e.key.toLowerCase();
   const map = {
@@ -1665,6 +2133,9 @@ function quickSave() {
 function init() {
   state.settings = store.loadSettings();
   state.library = store.loadLibrary();
+  // Documents predating size/date tracking get a created stamp so the file
+  // browser can sort them.
+  if (backfillDocMeta(state.library)) store.saveLibrary(state.library);
 
   // Expand the local root by default on first run.
   if (!state.settings.expanded) state.settings.expanded = { [LOCAL_ROOT_KEY]: true };

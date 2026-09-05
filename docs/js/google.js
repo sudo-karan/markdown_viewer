@@ -59,6 +59,14 @@ export function isSignedIn() {
 export function getProfile() {
   return profile;
 }
+/**
+ * Stable per-account id (the OpenID `sub` claim). Used to namespace this
+ * browser's local storage so several people can share a device and each see
+ * only their own documents. Falls back to the email if `sub` is absent.
+ */
+export function getAccountId() {
+  return profile ? profile.sub || profile.email || null : null;
+}
 
 // The GIS token client's callback/error_callback are set once at init time and
 // cannot be refreshed per request, so they must resolve the *current* pending
@@ -206,7 +214,7 @@ export const drive = {
     const id = parentId || (await ensureRootFolder());
     const q = encodeURIComponent(`'${id}' in parents and trashed=false`);
     const res = await authFetch(
-      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType,modifiedTime)&orderBy=folder,name&pageSize=1000`,
+      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType,size,createdTime,modifiedTime)&orderBy=folder,name&pageSize=1000`,
     );
     if (!res.ok) throw await driveError(res, "Could not list this folder.");
     const items = (await res.json()).files || [];
