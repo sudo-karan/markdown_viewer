@@ -83,6 +83,37 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   return defaultLinkOpen(tokens, idx, options, env, self);
 };
 
+/*
+ * Source-line mapping: stamp each top-level block element with the 0-based line
+ * of the Markdown source it came from (token.map). The editor and preview use
+ * these `data-source-line` anchors to scroll in lock-step and to jump from a
+ * clicked preview element back to its source in the editor. Only rules that
+ * render via renderToken (and therefore emit token attributes) are wrapped —
+ * notably NOT `fence`, whose custom highlight()/Mermaid handling builds its own
+ * markup and would drop the attribute anyway.
+ */
+function stampSourceLines(rules) {
+  for (const rule of rules) {
+    const prev =
+      md.renderer.rules[rule] ||
+      ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+    md.renderer.rules[rule] = (tokens, idx, options, env, self) => {
+      const t = tokens[idx];
+      if (t.level === 0 && t.map) t.attrSet("data-source-line", String(t.map[0]));
+      return prev(tokens, idx, options, env, self);
+    };
+  }
+}
+stampSourceLines([
+  "paragraph_open",
+  "heading_open",
+  "blockquote_open",
+  "bullet_list_open",
+  "ordered_list_open",
+  "table_open",
+  "hr",
+]);
+
 const ALERT_TYPES = {
   NOTE: "note",
   TIP: "tip",
@@ -137,7 +168,7 @@ export function renderMarkdown(text) {
   const dirty = md.render(text || "");
   return DOMPurify.sanitize(dirty, {
     USE_PROFILES: { html: true, mathMl: true, svg: true, svgFilters: true },
-    ADD_ATTR: ["target", "align", "start", "type", "checked", "disabled", "class", "style"],
+    ADD_ATTR: ["target", "align", "start", "type", "checked", "disabled", "class", "style", "data-source-line"],
     ADD_TAGS: ["details", "summary"],
     FORBID_TAGS: ["style"],
     ALLOW_DATA_ATTR: false,
@@ -167,7 +198,15 @@ let mermaidReady = false;
 function initMermaid(dark) {
   mermaid.initialize({
     startOnLoad: false,
+    // 'strict' keeps click-handlers/scripts out of untrusted diagrams.
     securityLevel: "strict",
+    // Render labels as real SVG <text>/<tspan> instead of HTML in a
+    // <foreignObject>. foreignObject label text is stripped by the SVG
+    // sanitizer below (it lives in the XHTML namespace), which is why diagrams
+    // previously rendered as empty shapes. Text mode survives sanitization and
+    // still honours <br/> line breaks in multi-line labels.
+    htmlLabels: false,
+    flowchart: { htmlLabels: false },
     theme: dark ? "dark" : "default",
     fontFamily: "var(--font-sans)",
   });
@@ -195,6 +234,10 @@ export async function enhance(container, { dark }) {
         const { svg } = await mermaid.render(`mmd-${i}-${Math.floor(Math.random() * 1e9)}`, src);
         const fig = document.createElement("div");
         fig.className = "mermaid-figure";
+        // Defense-in-depth second pass (Mermaid already sanitizes in strict mode).
+        // The SVG profile keeps <text>/<tspan> label text and the embedded <style>
+        // that colours the diagram; with htmlLabels off there is no foreignObject
+        // content left to lose here.
         fig.innerHTML = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
         pre.replaceWith(fig);
       } catch {
