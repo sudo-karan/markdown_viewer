@@ -145,7 +145,13 @@ function loadGis() {
     s.async = true;
     s.defer = true;
     s.onload = () => resolve();
-    s.onerror = () => reject(new Error("Could not load Google Identity Services."));
+    s.onerror = () => {
+      // Clear the cached rejection: without this, one blip (offline, a blocked
+      // network) permanently disabled sign-in until the page was reloaded.
+      gisPromise = null;
+      s.remove();
+      reject(new Error("Could not load Google Identity Services."));
+    };
     document.head.appendChild(s);
   });
   return gisPromise;
@@ -303,10 +309,16 @@ function requestToken({ prompt, hint } = {}) {
 let silentPromise = null;
 function silentToken() {
   if (silentPromise) return silentPromise;
+  const generation = authGeneration;
   silentPromise = (async () => {
     await loadGis();
     await requestToken({ prompt: "", hint: profile?.email });
     await loadProfile();
+    // loadProfile assigns `profile`, so a sign-out that happened while it was in
+    // flight was silently undone here — the account, its documents and the
+    // localStorage record all came back.
+    if (generation !== authGeneration) throw new Error("Signed out while refreshing.");
+    persistToken(); // re-stamp with the now-known owner
     persistAccount();
     announceAccount();
     return accessToken;
@@ -337,6 +349,7 @@ export async function signIn() {
     try {
       await requestToken({ prompt: "", hint: profile.email });
       await loadProfile();
+      persistToken(); // re-stamp: the owner is only known once the profile is in
       persistAccount();
       announceAccount();
       return profile;
@@ -347,6 +360,7 @@ export async function signIn() {
   try {
     await requestToken({ prompt: "consent" });
     await loadProfile();
+    persistToken(); // re-stamp with the now-known owner
   } catch (e) {
     // Do NOT forget the account here. Closing the popup, or a momentary
     // network failure, is not a request to sign out — clearing the profile
@@ -466,7 +480,10 @@ async function findRootFolderNamed(name) {
   const res = await authFetch(
     `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=1`,
   );
-  if (!res.ok) return null;
+  // A failed lookup is NOT "no such folder". Swallowing it meant one transient
+  // 500 made ensureRootFolder create a SECOND app folder, after which the tree
+  // reported "Empty" and every document the user had appeared to be gone.
+  if (!res.ok) throw await driveError(res, "Could not look up your Drive folder.");
   const data = await res.json();
   return data.files?.length ? data.files[0] : null;
 }

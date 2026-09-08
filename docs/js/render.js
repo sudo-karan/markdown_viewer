@@ -263,8 +263,11 @@ const ID_PREFIX = "user-content-";
 // Attributes whose value can point at an id defined elsewhere in the document.
 const SVG_REF_ATTRS = [
   "fill", "stroke", "filter", "mask", "clip-path", "style",
-  "marker-start", "marker-mid", "marker-end", "xlink:href",
+  "marker-start", "marker-mid", "marker-end", "xlink:href", "href",
 ];
+// Of those, the ones whose whole value can be a bare "#id". The paint
+// attributes cannot: there, a leading "#" is a colour.
+const HREF_ATTRS = new Set(["xlink:href", "href"]);
 let namespaceIds = false;
 
 DOMPurify.addHook("uponSanitizeElement", (node, data) => {
@@ -283,11 +286,25 @@ DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
     data.attrValue = scrubStyle(data.attrValue);
   }
 });
+// Class names the rendered document is allowed to keep. Everything else is
+// dropped: the app's own stylesheet is on the same page, so a document that
+// simply wrote class="modal" inherited `position: fixed; z-index: 51` from the
+// app's chrome and got the full-viewport overlay the inline-style scrubber
+// exists to prevent — without using an inline style at all. Only the classes
+// this pipeline itself emits, plus highlight.js tokens, survive.
+const ALLOWED_CLASS = /^(?:hljs(?:-[\w-]+)?|language-[\w+#-]+|katex(?:-[\w-]+)?|mord|mbin|mrel|mopen|mclose|mpunct|minner|mspace|vlist(?:-[\w-]+)?|base|strut|sizing|delimsizing|mtable|col-align-[a-z]|task-list-item(?:-checkbox)?|contains-task-list|footnotes?(?:-[\w-]+)?|footnote-(?:ref|backref|item)|anchor-link|md-alert(?:-title)?|note|tip|important|warning|caution|mermaid-(?:src|figure)|nodeLabel|edgeLabel|node|cluster|marker|flowchart-link|line|label|arrowhead)$/;
+
 DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   if (node.tagName === "A" && node.getAttribute("target") === "_blank") {
     node.setAttribute("rel", "noopener noreferrer");
   }
   if (!namespaceIds || !node.getAttribute) return;
+  const cls = node.getAttribute("class");
+  if (cls) {
+    const kept = cls.split(/\s+/).filter((c) => c && ALLOWED_CLASS.test(c));
+    if (kept.length) node.setAttribute("class", kept.join(" "));
+    else node.removeAttribute("class");
+  }
   const id = node.getAttribute("id");
   if (id && !id.startsWith(ID_PREFIX)) node.setAttribute("id", ID_PREFIX + id);
   // `<a name="x">` is the pre-HTML5 way of writing an anchor target. Forbidding
@@ -310,9 +327,14 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   // those pointing at nothing, so an inline SVG lost its fills and arrowheads.
   for (const attr of SVG_REF_ATTRS) {
     const v = node.getAttribute(attr);
-    if (v && v.includes("#") && !v.includes(ID_PREFIX)) {
-      node.setAttribute(attr, v.replace(/url\(\s*(['"]?)#/g, `url($1#${ID_PREFIX}`).replace(/^#/, "#" + ID_PREFIX));
-    }
+    if (!v || v.includes(ID_PREFIX)) continue;
+    // ONLY rewrite real references. The bare `^#` rule also matched hex colours,
+    // so fill="#4493f8" became fill="#user-content-4493f8" and every inline SVG
+    // rendered black with no stroke.
+    let next = v;
+    if (v.includes("url(")) next = next.replace(/url\(\s*(['"]?)#/g, `url($1#${ID_PREFIX}`);
+    if (HREF_ATTRS.has(attr) && /^#(?![0-9a-fA-F]{3,8}$)/.test(v)) next = "#" + ID_PREFIX + v.slice(1);
+    if (next !== v) node.setAttribute(attr, next);
   }
 });
 
