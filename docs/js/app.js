@@ -167,7 +167,8 @@ function updateStats() {
   // counted as a word, so a 40-item list over-reported by 40 and skewed the
   // reading time with it.
   const prose = editor.value
-    .replace(/^```[\s\S]*?^```/gm, "") // fenced code
+    .replace(/^ {0,3}(?:```|~~~)[\s\S]*?^ {0,3}(?:```|~~~)/gm, "") // fenced code, indented or not
+    .replace(/^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/gm, "") // table delimiter rows
     .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+[.)])\s+/gm, "") // block markers
     .replace(/^\s*\|.*\|\s*$/gm, (row) => row.replace(/\|/g, " ")) // table pipes
     .replace(/^\s*[-*_]{3,}\s*$/gm, ""); // thematic breaks
@@ -1602,8 +1603,11 @@ async function renderFiles() {
   if (seq !== filesRenderSeq) return; // superseded by a later navigation
   if (pruned) toast("That folder is gone — showing the folder above it");
   body.innerHTML = "";
+  // The two source rows at the root keep their natural order, so no column is
+  // actually sorted there — saying otherwise misleads a screen reader.
+  const sortingApplies = !!filesHere();
   document.querySelectorAll(".files-table th[data-sort]").forEach((th) => {
-    const active = th.dataset.sort === filesState.sort;
+    const active = sortingApplies && th.dataset.sort === filesState.sort;
     th.classList.toggle("sorted", active);
     th.dataset.dir = active ? (filesState.dir > 0 ? "asc" : "desc") : "";
     th.setAttribute("aria-sort", active ? (filesState.dir > 0 ? "ascending" : "descending") : "none");
@@ -2367,11 +2371,25 @@ function prefixLines(prefix, explicitRule) {
  */
 function insertBlock(text, caret) {
   const start = editor.selectionStart;
-  const before = editor.value.slice(0, start);
+  const end = editor.selectionEnd;
+  const value = editor.value;
+  const before = value.slice(0, start);
   const pad = before && !before.endsWith("\n\n") ? (before.endsWith("\n") ? "\n" : "\n\n") : "";
-  const full = pad + text;
-  const at = caret == null ? start + full.length : start + pad.length + caret;
-  replaceRange(full, start, editor.selectionEnd, at, at);
+  // A block that lands mid-line used to leave the rest of the line stuck to its
+  // closing delimiter — for a code fence that swallowed the remainder of the
+  // document into the code block.
+  const after = value.slice(end);
+  const tail = after && !after.startsWith("\n") ? "\n\n" : "";
+  // Selected text is content, not something to throw away: keep it inside the
+  // block when the template has a place for it, otherwise put it back after.
+  const selected = value.slice(start, end);
+  const body = selected && caret != null ? text.slice(0, caret) + selected + text.slice(caret) : text;
+  const full = pad + body + tail;
+  const at =
+    caret == null
+      ? start + pad.length + body.length
+      : start + pad.length + caret + (selected ? selected.length : 0);
+  replaceRange(full, start, end, selected && caret != null ? start + pad.length + caret : at, at);
 }
 
 const FORMATTERS = {
@@ -2671,7 +2689,12 @@ async function exportableHtml() {
   // a keystroke exporting the previous version.
   clearTimeout(state.renderTimer);
   await renderNow();
-  return preview.innerHTML;
+  // The permalink anchors are chrome, not content: pasted elsewhere they show
+  // up as a literal "#" before every heading.
+  const holder = document.createElement("div");
+  holder.innerHTML = preview.innerHTML;
+  holder.querySelectorAll(".anchor-link").forEach((a) => a.remove());
+  return holder.innerHTML;
 }
 
 function docBaseName() {
@@ -2973,6 +2996,9 @@ function wireEvents() {
   // now releases Tab for one press, which is the established pattern for
   // editors that consume it.
   let tabEscapes = false;
+  // Leaving and returning to the editor re-arms the trap; otherwise a stale flag
+  // made a later Tab jump out instead of indenting.
+  editor.addEventListener("blur", () => (tabEscapes = false));
   editor.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       tabEscapes = true;
@@ -3044,7 +3070,12 @@ function wireEvents() {
   });
 
   document.querySelectorAll("[data-fmt]").forEach((b) =>
-    b.addEventListener("click", () => FORMATTERS[b.dataset.fmt]?.()),
+    b.addEventListener("click", () => {
+      // In preview-only mode the editor is hidden, so formatting went into a
+      // document the user could not see, at a caret they could not place.
+      if (state.view === "preview") setView(isNarrow() ? "edit" : "split");
+      FORMATTERS[b.dataset.fmt]?.();
+    }),
   );
   document.querySelectorAll(".mode-btn").forEach((b) =>
     b.addEventListener("click", () => setView(b.dataset.view)),
@@ -3194,7 +3225,9 @@ function onShortcut(e) {
     t && t !== editor && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.isContentEditable);
   const modalOpen = !!document.querySelector(".modal:not([hidden])");
   const k = e.key.toLowerCase();
-  if ((inField || modalOpen) && k !== "s") return;
+  // Ctrl+S (save) is still useful from a field; Ctrl+Shift+S opens Drive work
+  // and would stack on top of an open dialog.
+  if ((inField || modalOpen) && !(k === "s" && !e.shiftKey)) return;
   const map = {
     s: () => (e.shiftKey ? saveToDrive() : quickSave()),
     b: () => FORMATTERS.bold(),
