@@ -260,6 +260,11 @@ const CHECKBOX_ATTRS = ["type", "checked", "disabled", "class", "id"];
 // this reason. Only applied to Markdown output; the Mermaid SVG pass needs its
 // internal `url(#id)` marker references left intact.
 const ID_PREFIX = "user-content-";
+// Attributes whose value can point at an id defined elsewhere in the document.
+const SVG_REF_ATTRS = [
+  "fill", "stroke", "filter", "mask", "clip-path", "style",
+  "marker-start", "marker-mid", "marker-end", "xlink:href",
+];
 let namespaceIds = false;
 
 DOMPurify.addHook("uponSanitizeElement", (node, data) => {
@@ -285,11 +290,28 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   if (!namespaceIds || !node.getAttribute) return;
   const id = node.getAttribute("id");
   if (id && !id.startsWith(ID_PREFIX)) node.setAttribute("id", ID_PREFIX + id);
+  // `<a name="x">` is the pre-HTML5 way of writing an anchor target. Forbidding
+  // the attribute outright broke those documents while their inbound links were
+  // still being rewritten to point at them; prefix it like an id instead. It is
+  // harmless here because every form control is stripped, so nothing can submit.
+  const nm = node.getAttribute("name");
+  if (nm && node.tagName === "A" && !nm.startsWith(ID_PREFIX)) {
+    node.setAttribute("name", ID_PREFIX + nm);
+  }
   if (node.tagName === "A") {
     const href = node.getAttribute("href") || "";
     // Keep in-document links working now that their targets are prefixed.
     if (href.length > 1 && href[0] === "#" && !href.startsWith("#" + ID_PREFIX)) {
       node.setAttribute("href", "#" + ID_PREFIX + href.slice(1));
+    }
+  }
+  // Inline SVG refers to its own <defs> by id — gradients, markers, filters,
+  // clip paths. Prefixing the definitions without prefixing the references left
+  // those pointing at nothing, so an inline SVG lost its fills and arrowheads.
+  for (const attr of SVG_REF_ATTRS) {
+    const v = node.getAttribute(attr);
+    if (v && v.includes("#") && !v.includes(ID_PREFIX)) {
+      node.setAttribute(attr, v.replace(/url\(\s*(['"]?)#/g, `url($1#${ID_PREFIX}`).replace(/^#/, "#" + ID_PREFIX));
     }
   }
 });
@@ -311,7 +333,7 @@ export function renderMarkdown(text) {
       // into Export HTML, Copy HTML and any text selection.
       ADD_TAGS: ["details", "summary", "semantics", "annotation"],
       FORBID_TAGS: ["style", ...FORM_TAGS],
-      FORBID_ATTR: ["action", "formaction", "form", "method", "enctype", "autofocus", "name"],
+      FORBID_ATTR: ["action", "formaction", "form", "method", "enctype", "autofocus"],
       ALLOW_DATA_ATTR: false,
     });
   } finally {

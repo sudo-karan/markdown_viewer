@@ -730,6 +730,16 @@ button { font-family: inherit; }
   border-radius: 12px;
   box-shadow: var(--shadow);
 }
+/* The account popover borrows the dialog's look without being a .modal — the
+   keyboard-shortcut guard keys off an open .modal, so matching that class
+   silently disabled every editor shortcut while the popover was open. */
+.popover-panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  z-index: 60;
+}
+
 /* The `hidden` attribute must win over `.modal { display: flex }`. */
 .modal[hidden],
 .modal-backdrop[hidden] {

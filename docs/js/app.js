@@ -297,6 +297,22 @@ function persist(doc, { markSaved = true, rerender = true, touch = true } = {}) 
 }
 
 /**
+ * Write the library, and tell the user when the browser refuses. Every direct
+ * `store.saveLibrary(...)` used to drop the boolean on the floor, so an import,
+ * a rename, a move or a Drive binding could report a cheerful green success for
+ * a write that never happened — and the work was gone on the next reload.
+ * @returns {boolean}
+ */
+function saveLibrary() {
+  const ok = store.saveLibrary(state.library);
+  if (!ok) {
+    setSaveState("error");
+    toast("Couldn't save to this browser — storage is full or blocked. Download a copy.", "error");
+  }
+  return ok;
+}
+
+/**
  * Documents removed from the library. Held weakly and checked by persist() and
  * the Drive push, so no timer armed before the delete can bring one back.
  */
@@ -349,7 +365,7 @@ function newDoc(name = "Untitled.md", text = "", folder = "") {
   const now = Date.now();
   const doc = { id: uid(), name, text, driveId: null, folder, created: now, updated: now };
   state.library = upsertDoc(state.library, doc);
-  store.saveLibrary(state.library);
+  saveLibrary();
   loadDoc(doc);
   return doc;
 }
@@ -882,7 +898,7 @@ function renameLocalFolder(path) {
       delete em[k];
     }
   }
-  store.saveLibrary(state.library);
+  saveLibrary();
   store.saveSettings(state.settings);
   refreshViews();
   toast("Folder renamed");
@@ -902,7 +918,7 @@ function deleteLocalFolder(path) {
   for (const k of Object.keys(em)) {
     if (k === "L:" + path || k.startsWith("L:" + path + "/")) delete em[k];
   }
-  store.saveLibrary(state.library);
+  saveLibrary();
   store.saveSettings(state.settings);
   if (state.current && ids.has(state.current.id)) {
     const next = state.library[0];
@@ -1057,7 +1073,7 @@ async function copyDriveFileToLocal(dragData, targetPath) {
       folder: targetPath || "", created: now, updated: now,
     };
     state.library = upsertDoc(state.library, doc);
-    store.saveLibrary(state.library);
+    saveLibrary();
     setExpanded(LOCAL_ROOT_KEY, true);
     if (targetPath) setExpanded("L:" + targetPath, true);
     refreshViews();
@@ -1138,7 +1154,7 @@ async function importFilesInto(fileList, target, { openSingle = false } = {}) {
         state.library = upsertDoc(state.library, lastLocalDoc);
         ok++;
       }
-      store.saveLibrary(state.library);
+      saveLibrary();
       setExpanded(LOCAL_ROOT_KEY, true);
       if (folder) setExpanded("L:" + folder, true);
     }
@@ -1164,6 +1180,7 @@ async function newFileDrive(parentId) {
     const res = await google.drive.create(name, "", parentId);
     const c = state.driveCache[parentId];
     if (c && c.loaded) c.files.push(res);
+    const now = Date.now();
     const doc = {
       id: uid(),
       name: res.name || name,
@@ -1171,10 +1188,14 @@ async function newFileDrive(parentId) {
       driveId: res.id,
       driveName: res.name || name,
       driveParentId: parentId,
-      updated: Date.now(),
+      created: now,
+      updated: now,
+      // Created empty and already in Drive — without this the status bar said
+      // "· syncing…" forever, because updated > driveSyncedAt from the start.
+      driveSyncedAt: now,
     };
     state.library = upsertDoc(state.library, doc);
-    store.saveLibrary(state.library);
+    saveLibrary();
     loadDoc(doc);
     toast("Created in Drive", "success");
   } catch (e) {
@@ -1209,7 +1230,7 @@ async function renameDriveFile(f, parentId) {
       doc.name = name;
       doc.driveName = name;
       if (doc.id === state.current?.id) docTitle.value = name;
-      store.saveLibrary(state.library);
+      saveLibrary();
     }
     void parentId;
     refreshViews();
@@ -1241,7 +1262,7 @@ async function deleteDriveFile(f, parentId) {
     if (doc) {
       forgetDoc(doc); // a queued push would otherwise write into the trashed file
       state.library = removeDoc(state.library, doc.id);
-      store.saveLibrary(state.library);
+      saveLibrary();
       if (state.current?.id === doc.id) {
         const next = state.library[0];
         if (next) loadDoc(next);
@@ -1291,7 +1312,7 @@ async function deleteDriveFolder(f, parentId) {
         rescued++;
       }
     }
-    if (rescued) store.saveLibrary(state.library);
+    if (rescued) saveLibrary();
     for (const id of subtree) delete state.driveCache[id];
     if (state.current?.driveId === null) updateStorageLoc();
     refreshViews();
@@ -1319,7 +1340,7 @@ async function moveDrive(dragData, targetId) {
     const doc = state.library.find((d) => d.driveId === dragData.id);
     if (doc) {
       doc.driveParentId = targetId;
-      store.saveLibrary(state.library);
+      saveLibrary();
     }
     refreshViews();
     toast("Moved");
@@ -1332,7 +1353,7 @@ function deleteDoc(doc) {
   if (!confirm(`Delete "${doc.name}"? This only removes it from this browser.`)) return;
   forgetDoc(doc);
   state.library = removeDoc(state.library, doc.id);
-  store.saveLibrary(state.library);
+  saveLibrary();
   if (state.current?.id === doc.id) {
     const next = state.library[0];
     if (next) loadDoc(next);
@@ -1832,6 +1853,12 @@ async function saveToDrive(targetFolderId) {
     openModal("settings-modal");
     return;
   }
+  // Capture the target now. ensureSignedIn() can switch accounts, which reloads
+  // state.library and state.current — so re-reading state.current after the
+  // awaits below uploaded, renamed or moved a DIFFERENT document than the one
+  // the user was looking at when they pressed the button.
+  const target = state.current;
+  if (!target) return;
   setSaveState("saving");
   try {
     // Must go through ensureSignedIn, not google.signIn: signing in here without
@@ -1839,35 +1866,47 @@ async function saveToDrive(targetFolderId) {
     // signed-out bucket while the header showed an account — and the next person
     // to sign in on this browser inherited them, Drive ids and all.
     await ensureSignedIn();
-    const name = ensureMdName(state.current.name);
-    if (state.current.driveId) {
+    // Signing in can switch accounts, which reloads the library into fresh
+    // objects — so re-resolve by id rather than by identity. (Comparing the
+    // object itself made this bail on the very document it had just adopted.)
+    const doc = state.library.find((d) => d.id === target.id);
+    if (!doc) {
+      setSaveState("saved");
+      toast("That document isn't in the signed-in account — open it again to save it", "error");
+      return;
+    }
+    const name = ensureMdName(doc.name);
+    const showTitle = () => {
+      if (state.current?.id === doc.id) docTitle.value = doc.name;
+    };
+    if (doc.driveId) {
       // update() only writes content; title/location changes go separately.
-      await google.drive.update(state.current.driveId, state.current.text);
-      if (name !== state.current.driveName) {
-        const renamed = await google.drive.rename(state.current.driveId, name);
-        state.current.name = renamed.name || name;
-        state.current.driveName = renamed.name || name;
-        docTitle.value = state.current.name;
+      await google.drive.update(doc.driveId, doc.text);
+      if (name !== doc.driveName) {
+        const renamed = await google.drive.rename(doc.driveId, name);
+        doc.name = renamed.name || name;
+        doc.driveName = renamed.name || name;
+        showTitle();
       }
-      if (targetFolderId && targetFolderId !== state.current.driveParentId) {
-        await google.drive.move(state.current.driveId, targetFolderId, state.current.driveParentId);
-        state.current.driveParentId = targetFolderId;
+      if (targetFolderId && targetFolderId !== doc.driveParentId) {
+        await google.drive.move(doc.driveId, targetFolderId, doc.driveParentId);
+        doc.driveParentId = targetFolderId;
       }
     } else {
-      const res = await google.drive.create(name, state.current.text, targetFolderId);
-      state.current.driveId = res.id;
-      state.current.driveParentId = (res.parents && res.parents[0]) || targetFolderId || null;
-      state.current.name = res.name || name;
-      state.current.driveName = res.name || name;
-      docTitle.value = state.current.name;
+      const res = await google.drive.create(name, doc.text, targetFolderId);
+      doc.driveId = res.id;
+      doc.driveParentId = (res.parents && res.parents[0]) || targetFolderId || null;
+      doc.name = res.name || name;
+      doc.driveName = res.name || name;
+      showTitle();
       // Binding a document to Drive takes it out of the local tree, so the row
       // has to appear on the Drive side in the same breath — otherwise saving
       // made the document vanish from both views until a reload.
-      cacheDriveFile(state.current.driveParentId, res);
-      revealDriveFolder(state.current.driveParentId);
+      cacheDriveFile(doc.driveParentId, res);
+      revealDriveFolder(doc.driveParentId);
     }
-    state.current.driveSyncedAt = Date.now();
-    persist(state.current);
+    doc.driveSyncedAt = Date.now();
+    persist(doc);
     updateStorageLoc();
     refreshGoogleUI();
     toast("Saved to Google Drive", "success");
@@ -1900,9 +1939,10 @@ async function openDriveFile(f, parentId) {
       existing.driveParentId = parentId || existing.driveParentId || null;
       existing.updated = Date.now();
       existing.driveSyncedAt = existing.updated; // just read from Drive: in sync
-      store.saveLibrary(state.library); // persist refreshed content immediately
+      saveLibrary(); // persist refreshed content immediately
       loadDoc(existing);
     } else {
+      const now = Date.now();
       const doc = {
         id: uid(),
         name: f.name,
@@ -1910,10 +1950,12 @@ async function openDriveFile(f, parentId) {
         driveId: f.id,
         driveName: f.name,
         driveParentId: parentId || null,
+        created: now,
+        driveSyncedAt: now, // just downloaded: in sync, not "syncing…"
         updated: Date.now(),
       };
       state.library = upsertDoc(state.library, doc);
-      store.saveLibrary(state.library);
+      saveLibrary();
       loadDoc(doc);
     }
     toast("Opened from Drive", "success");
@@ -1973,7 +2015,7 @@ function refreshGoogleUI() {
 function reloadForAccount() {
   state.settings = store.loadSettings();
   state.library = store.loadLibrary();
-  if (backfillDocMeta(state.library)) store.saveLibrary(state.library);
+  if (backfillDocMeta(state.library)) saveLibrary();
 
   // Drive ids belong to whoever was signed in before — never reuse them.
   state.driveRootId = null;
@@ -2071,8 +2113,7 @@ async function syncLocalDocsToDrive() {
     openModal("settings-modal");
     return;
   }
-  const pending = state.library.filter((d) => !d.driveId);
-  if (!pending.length) {
+  if (!state.library.some((d) => !d.driveId)) {
     toast("Every document is already in your Drive", "success");
     return;
   }
@@ -2080,6 +2121,17 @@ async function syncLocalDocsToDrive() {
   let ok = 0;
   try {
     await ensureSignedIn();
+    // Take the list AFTER authenticating. Signing in can switch accounts and
+    // reload state.library into fresh objects, so a snapshot taken before the
+    // await belonged to the previous account: those uploads went to the new
+    // account's Drive and their bindings were written to objects no longer in
+    // the library, losing every one of them.
+    const pending = state.library.filter((d) => !d.driveId);
+    if (!pending.length) {
+      setSaveState("saved");
+      toast("Every document is already in your Drive", "success");
+      return;
+    }
     const root = await google.drive.root();
     for (const doc of pending) {
       try {
@@ -2093,9 +2145,12 @@ async function syncLocalDocsToDrive() {
         /* one bad file shouldn't abort the rest; the count reports the truth */
       }
     }
-    store.saveLibrary(state.library);
-    state.driveCache = {};
-    refreshViews();
+    saveLibrary();
+    // Re-list the destination rather than emptying the whole cache: blanking it
+    // left every expanded Drive folder with no contents, so the documents that
+    // had just been synced vanished from the sidebar until a reload.
+    await loadDriveFolder(root.id, { force: true });
+    revealDriveFolder(root.id);
     setSaveState(ok === pending.length ? "saved" : "error");
     toast(
       `Synced ${ok} of ${pending.length} document${pending.length === 1 ? "" : "s"} to Drive`,
@@ -2112,7 +2167,10 @@ let menuEl = null;
 function toggleGoogleMenu() {
   if (menuEl) return closeGoogleMenu();
   menuEl = document.createElement("div");
-  menuEl.className = "modal";
+  // Deliberately NOT class "modal": the shortcut guard keys off an open .modal,
+  // so styling this popover as one silently disabled every editor shortcut
+  // while it was open. It borrows the look via .popover-panel instead.
+  menuEl.className = "popover-panel";
   Object.assign(menuEl.style, {
     position: "fixed",
     width: "200px",
@@ -2272,7 +2330,7 @@ const LINE_PREFIX_RULES = {
   "- [ ] ": { family: /^[-*+] (?:\[[ xX]\] )?/, exact: /^[-*+] \[[ xX]\] / },
 };
 
-function prefixLines(prefix) {
+function prefixLines(prefix, explicitRule) {
   const start = editor.selectionStart;
   const end = editor.selectionEnd;
   const value = editor.value;
@@ -2284,13 +2342,13 @@ function prefixLines(prefix) {
   const blockEnd = end > lineStart && value[end - 1] === "\n" ? end - 1 : end;
   const block = value.slice(lineStart, blockEnd);
   const lines = block.split("\n");
-  const rule = typeof prefix === "function" ? null : LINE_PREFIX_RULES[prefix];
+  const rule = explicitRule || (typeof prefix === "function" ? null : LINE_PREFIX_RULES[prefix]);
   let replaced;
   if (rule && lines.every((l) => rule.exact.test(l))) {
     // Already exactly this — a second press turns it off ("# # heading" was the
     // old behaviour).
     replaced = lines.map((l) => l.replace(rule.family, "")).join("\n");
-  } else if (rule && lines.every((l) => rule.family.test(l))) {
+  } else if (rule && typeof prefix === "string" && lines.every((l) => rule.family.test(l))) {
     // A different member of the same family — convert instead of stacking.
     // "- " is a prefix of "- [ ] ", so the naive version either destroyed a
     // checklist ("[ ] item") or doubled the marker ("- - [ ] item").
@@ -2325,7 +2383,12 @@ const FORMATTERS = {
   h2: () => prefixLines("## "),
   quote: () => prefixLines("> "),
   ul: () => prefixLines("- "),
-  ol: () => prefixLines((l, i) => `${i + 1}. ${l}`),
+  ol: () =>
+    prefixLines((l, i) => `${i + 1}. ${l}`, {
+      // Without this a second press produced "1. 1. item".
+      family: /^\d+[.)] /,
+      exact: /^\d+[.)] /,
+    }),
   task: () => prefixLines("- [ ] "),
   link: () => surround("[", "](https://)", "link text"),
   image: () => insertBlock("![alt text](https://)"),
@@ -2949,10 +3012,13 @@ function wireEvents() {
   });
 
   docTitle.addEventListener("change", async () => {
-    if (!state.current) return;
+    // Bound to the document being renamed, not to whatever is current when the
+    // Drive round-trip below returns.
+    const doc = state.current;
+    if (!doc) return;
     const name = docTitle.value.trim() || "Untitled.md";
-    if (name === state.current.name) return;
-    state.current.name = name;
+    if (name === doc.name) return;
+    doc.name = name;
     // Rename in place at the source: Drive files rename via API immediately.
     if (state.current.driveId) {
       const finalName = ensureMdName(name);
@@ -3177,7 +3243,7 @@ function init() {
   state.library = store.loadLibrary();
   // Documents predating size/date tracking get a created stamp so the file
   // browser can sort them.
-  if (backfillDocMeta(state.library)) store.saveLibrary(state.library);
+  if (backfillDocMeta(state.library)) saveLibrary();
 
   // Expand the local root by default on first run.
   if (!state.settings.expanded) state.settings.expanded = { [LOCAL_ROOT_KEY]: true };
