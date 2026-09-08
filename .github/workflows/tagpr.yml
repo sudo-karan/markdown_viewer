@@ -1,9 +1,13 @@
 name: tagpr
 
+# This fork's work is the static web app in docs/, which GitHub Pages serves
+# straight from main — it is not versioned or released. Running tagpr on every
+# push to main therefore did nothing but open a "Release for vX.Y.Z" pull
+# request after each merge, which then had to be closed again (#6, #16).
+#
+# Manual only: dispatch this workflow if you ever do want to cut a release of
+# the Go CLI, and restore the push trigger if releases become routine again.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:

@@ -7,9 +7,9 @@
  */
 // ?v= cache-buster: bump on every JS change (keep in sync with index.html's
 // script tag) so a deploy never leaves the browser on a stale module.
-import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908c";
-import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908c";
-import * as google from "./google.js?v=20260908c";
+import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908d";
+import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908d";
+import * as google from "./google.js?v=20260908d";
 import LZString from "https://esm.sh/lz-string@1.5.0";
 
 const CONFIG = window.MO_STUDIO_CONFIG || {};
@@ -106,9 +106,12 @@ const googleAvatar = $("google-avatar");
 let toastTimer = 0;
 let toastHideTimer = 0;
 function toast(msg, kind = "") {
-  toastEl.textContent = msg;
+  // Show the region BEFORE writing into it. It used to be `hidden` (so
+  // display:none) at the moment textContent changed, and a live region that is
+  // not rendered is not announced — screen-reader users were told nothing at
+  // all, including for "Couldn't save to this browser" and Drive failures.
   toastEl.className = "toast show " + kind;
-  toastEl.hidden = false;
+  toastEl.textContent = msg;
   // Both timers must be cancelled: the nested one used to survive, so a message
   // arriving 2.6-2.8s after the previous one was wiped ~200ms later — long
   // enough to appear, too short to read. "Save failed" landing in that window
@@ -117,7 +120,10 @@ function toast(msg, kind = "") {
   clearTimeout(toastHideTimer);
   toastTimer = setTimeout(() => {
     toastEl.classList.remove("show");
-    toastHideTimer = setTimeout(() => (toastEl.hidden = true), 200);
+    // Clear rather than hide: the region has to stay in the accessibility tree
+    // for the next message to be announced, and stale text should not be left
+    // there for a screen reader to wander into.
+    toastHideTimer = setTimeout(() => (toastEl.textContent = ""), 200);
   }, 2600);
 }
 
@@ -142,6 +148,22 @@ function applyTheme(dark) {
 
 /* ------------------------------------------------------------------ view mode */
 const isNarrow = () => window.matchMedia?.("(max-width: 720px)")?.matches === true;
+
+/**
+ * At phone width the sidebar is an overlay sitting on top of the document, so
+ * choosing a file used to load it *behind* the sidebar with no way back except
+ * hunting for the header toggle again. Get out of the way once the user has
+ * picked something.
+ *
+ * Deliberately not persisted: `sidebarCollapsed` is synced settings, and writing
+ * it here would collapse the sidebar on the desktop too — the same mistake the
+ * coerced "preview" view made (see setView's `remember: false`).
+ */
+function autoCollapseSidebar() {
+  if (!isNarrow() || app.classList.contains("sidebar-collapsed")) return;
+  app.classList.add("sidebar-collapsed");
+  $("sidebar-toggle").setAttribute("aria-expanded", "false");
+}
 
 function setView(view, { remember = true } = {}) {
   // There is no room for two panes on a phone — the stylesheet hides the editor
@@ -584,8 +606,12 @@ function makeRow(o) {
   }
 
   const activate = () => {
-    if (o.onActivate) o.onActivate();
-    else if (o.onToggle) o.onToggle();
+    if (o.onActivate) {
+      o.onActivate();
+      // Only leaf rows open a document; expanding a folder should leave the
+      // sidebar exactly where it is.
+      if (!o.twisty) autoCollapseSidebar();
+    } else if (o.onToggle) o.onToggle();
   };
   row.addEventListener("click", (e) => {
     if (e.target.closest(".tree-kebab")) return;
@@ -996,6 +1022,16 @@ function renameLocalFolder(path) {
       delete em[k];
     }
   }
+  // The Files breadcrumb stores paths, so without this the trail still pointed
+  // at the old one: pruneFilesTrail then found nothing there and popped the user
+  // out with "That folder is gone" — for a folder that had only been renamed.
+  for (const t of filesState.trail) {
+    if (t.source !== "local" || !t.path) continue;
+    const moved = renamePrefix(t.path, path, newPath);
+    if (moved === t.path) continue;
+    t.path = moved;
+    t.name = moved.split("/").pop();
+  }
   saveLibrary();
   store.saveSettings(state.settings);
   refreshViews();
@@ -1360,6 +1396,10 @@ async function newFileDrive(parentId) {
     state.library = upsertDoc(state.library, doc);
     saveLibrary();
     loadDoc(doc);
+    // Show the user what they just made. Without this the file existed in Drive
+    // and was the open document, but no row for it appeared anywhere unless the
+    // user happened to expand that folder by hand — newFileLocal reveals it.
+    revealDriveFolder(parentId);
     toast("Created in Drive", "success");
   } catch (e) {
     reportDriveError(e, "Could not create file");
@@ -1409,6 +1449,12 @@ async function renameDriveFolder(f) {
     await google.drive.rename(f.id, name);
     f.name = name;
     if (state.driveCache[f.id]) state.driveCache[f.id].name = name;
+    // The Files breadcrumb caches the name it was built with, so renaming a
+    // folder you are standing inside left the two views calling the same folder
+    // different things — indefinitely, since nothing else rewrites the trail.
+    for (const t of filesState.trail) {
+      if (t.source === "drive" && t.folderId === f.id) t.name = name;
+    }
     refreshViews();
     toast("Renamed", "success");
   } catch (e) {
@@ -1598,6 +1644,15 @@ const filesState = {
 const filesHere = () => filesState.trail[filesState.trail.length - 1] || null;
 
 /**
+ * Set by the things that count as "the user asking again" — opening the Files
+ * view, stepping into a row, clicking a breadcrumb — and consumed by the next
+ * collectFileRows. A cached Drive error is retried on those, and only on those:
+ * a plain repaint must never trigger a fetch, or the repaint that
+ * loadDriveFolder does when it fails becomes an unbounded loop.
+ */
+let filesNavRetry = false;
+
+/**
  * Drive folders this session actually deleted. The Files-view breadcrumb needs
  * to tell "deleted" apart from "not listed yet" — everything else is unknown,
  * not gone.
@@ -1698,9 +1753,14 @@ async function collectFileRows() {
   if (!(await ensureDriveReady())) return [];
   const folderId = here.folderId || state.driveRootId;
   if (!here.folderId) here.folderId = folderId;
-  // Navigating in is the user asking again, so a previous failure retries here
-  // instead of showing the stale error for the rest of the session.
-  await loadDriveFolder(folderId, { force: !!state.driveCache[folderId]?.error });
+  // Navigating in is the user asking again, so a previous failure retries —
+  // but ONCE, tied to the navigation, not to the render. Forcing on every
+  // render re-armed the loop loadDriveFolder documents: it repaints in its
+  // `finally`, which re-enters this function, which forces again (measured at
+  // ~200 Drive requests a second against a folder that keeps failing).
+  const retry = filesNavRetry;
+  filesNavRetry = false;
+  await loadDriveFolder(folderId, { force: retry && !!state.driveCache[folderId]?.error });
   const c = state.driveCache[folderId];
   if (!c) return [];
   if (c.error) return [{ kind: "error", name: c.error }];
@@ -1755,7 +1815,13 @@ function renderFilesCrumbs() {
     b.className = "crumb";
     b.textContent = label;
     b.addEventListener("click", () => {
+      // The crumb is about to be destroyed by the re-render. Keyboard users were
+      // dropped onto <body>, so the next Tab restarted from the top of the page:
+      // navigation worked downward (rows keep focus) and broke upward. Only
+      // steal focus when the activation actually came from the keyboard.
+      filesFocusFirstRow = document.activeElement?.closest?.("#files-crumbs") != null;
       filesState.trail = filesState.trail.slice(0, index);
+      filesNavRetry = true;
       renderFiles();
     });
     nav.appendChild(b);
@@ -1836,7 +1902,24 @@ async function renderFiles() {
   });
   if (!rows.length) {
     filesFocusFirstRow = false;
-    body.innerHTML = `<tr><td colspan="5" class="files-empty">This folder is empty.</td></tr>`;
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "files-empty";
+    // The sidebar was fixed not to call a Drive folder "empty": with the
+    // least-privilege drive.file scope the app only sees what it created, so a
+    // folder the user filled from drive.google.com looks empty. Saying just
+    // "This folder is empty." here left the two views contradicting each other.
+    if (filesHere()?.source === "drive") {
+      td.textContent = "Empty — this app only sees files it created here.";
+      const line = document.createElement("div");
+      line.textContent = "Files added on drive.google.com won't show up; import or drag them in.";
+      td.appendChild(line);
+    } else {
+      td.textContent = "This folder is empty.";
+    }
+    tr.appendChild(td);
+    body.appendChild(tr);
     return;
   }
   if (rows.length === 1 && (rows[0].kind === "note" || rows[0].kind === "error")) {
@@ -1900,6 +1983,7 @@ async function renderFiles() {
       const go = () => {
         if (r.nav) {
           filesState.trail = [...filesState.trail, r.nav];
+          filesNavRetry = true;
           // Keep the keyboard in the table. The tbody is rebuilt from scratch,
           // which dropped focus onto <body> — so a keyboard user had to Tab past
           // the toolbar again for every level of nesting.
@@ -1933,6 +2017,7 @@ async function renderFiles() {
 function openFiles() {
   app.classList.add("files-open");
   $("files-view").hidden = false;
+  filesNavRetry = true;
   renderFiles();
 }
 function closeFiles() {
@@ -2582,12 +2667,18 @@ function surround(before, after = before, placeholder = "") {
  * IS this style" (press again to remove it); `family` is the whole marker to
  * strip or replace, so switching within a family converts rather than stacks.
  */
+// One family for every list marker — bullet, task and ordered alike — so the
+// three list buttons convert between each other instead of stacking. With the
+// ordered marker in its own family, "- alpha" + Numbered list produced
+// "1. - alpha" (a numbered item containing a bullet) and "1. alpha" + Bullet
+// list produced "- 1. alpha".
+const LIST_FAMILY = /^(?:[-*+] (?:\[[ xX]\] )?|\d+[.)] )/;
 const LINE_PREFIX_RULES = {
   "# ": { family: /^#{1,6} /, exact: /^# (?!#)/ },
   "## ": { family: /^#{1,6} /, exact: /^## (?!#)/ },
   "> ": { family: /^> ?/, exact: /^> / },
-  "- ": { family: /^[-*+] (?:\[[ xX]\] )?/, exact: /^[-*+] (?!\[[ xX]\] )/ },
-  "- [ ] ": { family: /^[-*+] (?:\[[ xX]\] )?/, exact: /^[-*+] \[[ xX]\] / },
+  "- ": { family: LIST_FAMILY, exact: /^[-*+] (?!\[[ xX]\] )/ },
+  "- [ ] ": { family: LIST_FAMILY, exact: /^[-*+] \[[ xX]\] / },
 };
 
 function prefixLines(prefix, explicitRule) {
@@ -2623,7 +2714,15 @@ function prefixLines(prefix, explicitRule) {
     // checklist ("[ ] item") or doubled the marker ("- - [ ] item").
     replaced = lines.map((l) => l.replace(rule.family, prefix)).join("\n");
   } else {
-    replaced = lines.map((l, i) => (typeof prefix === "function" ? prefix(l, i) : prefix + l)).join("\n");
+    // A partly-marked selection lands here — "- alpha" and "beta" with the
+    // bullet button — and used to stack a second marker onto the line that
+    // already had one ("- - alpha"). Replace a same-family marker per line.
+    replaced = lines
+      .map((l, i) => {
+        if (typeof prefix === "function") return prefix(l, i);
+        return prefix + (rule?.family.test(l) ? l.replace(rule.family, "") : l);
+      })
+      .join("\n");
   }
   // Keep the lines selected so actions can be chained (bullet, then quote).
   replaceRange(replaced, lineStart, blockEnd, lineStart, lineStart + replaced.length);
@@ -2670,9 +2769,13 @@ const FORMATTERS = {
   quote: () => prefixLines("> "),
   ul: () => prefixLines("- "),
   ol: () =>
-    prefixLines((l, i) => `${i + 1}. ${l}`, {
+    // The formatter strips any existing list marker itself: the conversion
+    // branch in prefixLines only runs for string prefixes (a function prefix
+    // would be called as a String.replace replacer), and this way a mixed
+    // selection renumbers rather than nesting.
+    prefixLines((l, i) => `${i + 1}. ${l.replace(LIST_FAMILY, "")}`, {
       // Without this a second press produced "1. 1. item".
-      family: /^\d+[.)] /,
+      family: LIST_FAMILY,
       exact: /^\d+[.)] /,
     }),
   task: () => prefixLines("- [ ] "),
@@ -3288,7 +3391,17 @@ function wireEvents() {
       return;
     }
     const lineStart = value.lastIndexOf("\n", s - 1) + 1;
-    const blockEnd = en > lineStart && value[en - 1] === "\n" ? en - 1 : en;
+    // A collapsed caret outdents the line it sits on. Slicing to the caret made
+    // the block empty when the caret was at column 0, so `next === block` and
+    // Shift+Tab silently did nothing on an indented line — with preventDefault
+    // already called, so focus did not move either.
+    let blockEnd;
+    if (s === en) {
+      const nl = value.indexOf("\n", s);
+      blockEnd = nl === -1 ? value.length : nl;
+    } else {
+      blockEnd = en > lineStart && value[en - 1] === "\n" ? en - 1 : en;
+    }
     const block = value.slice(lineStart, blockEnd);
     const next = e.shiftKey
       ? block.split("\n").map((l) => l.replace(/^ {1,2}/, "")).join("\n")
@@ -3420,7 +3533,13 @@ function wireEvents() {
   // Sidebar tabs + toggle
   document.querySelectorAll(".side-tab").forEach((tab) =>
     tab.addEventListener("click", () => {
-      document.querySelectorAll(".side-tab").forEach((t) => t.classList.toggle("is-active", t === tab));
+      document.querySelectorAll(".side-tab").forEach((t) => {
+        const on = t === tab;
+        t.classList.toggle("is-active", on);
+        // The blue underline was the only signal of which tab was showing, so a
+        // screen reader heard two tabs and no indication of the current one.
+        t.setAttribute("aria-selected", String(on));
+      });
       document.querySelectorAll(".side-panel").forEach((p) => (p.hidden = p.dataset.panel !== tab.dataset.tab));
     }),
   );
