@@ -51,6 +51,11 @@ jobs:
           fail_level: error
           go_version_file: go.mod
           cache: false
+          # Pinned. This input defaults to "latest", so a golangci-lint release
+          # could add a rule and turn main red with no commit of ours — which is
+          # how modernize/errorsastype broke it. Bump deliberately, with the
+          # findings the new version brings fixed in the same pull request.
+          golangci_lint_version: v2.13.2
 
       - name: Run gostyle
         if: runner.os == 'Linux'
