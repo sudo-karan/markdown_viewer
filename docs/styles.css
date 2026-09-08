@@ -186,6 +186,12 @@ button { font-family: inherit; }
   border-radius: 50%;
   display: block;
 }
+/* An author `display` rule beats the UA's [hidden] { display:none }, so the
+   empty avatar kept taking 22px inside the signed-out button. */
+.google-avatar[hidden] { display: none; }
+/* Signed in, but the token needs renewing — Drive actions still work, they
+   just may ask for a click first. */
+.google-btn.is-stale { border-style: dashed; }
 
 /* ============================ Toolbar ============================ */
 .toolbar {
@@ -316,6 +322,8 @@ button { font-family: inherit; }
 .tree-row.is-active .tree-twisty,
 .tree-row.is-active .tree-kebab { color: var(--accent-fg); }
 .tree-row.drop-target { box-shadow: inset 0 0 0 2px var(--accent); }
+/* Hints explain things (e.g. why a Drive folder looks empty), so let them wrap. */
+.tree-hint { white-space: normal; line-height: 1.35; }
 
 .tree-twisty {
   width: 14px;
@@ -463,6 +471,15 @@ button { font-family: inherit; }
   overflow: hidden;
 }
 .files-view[hidden] { display: none; }
+/* The heading label is a button so sorting is keyboard-reachable; it must
+   still look like a table heading. */
+.th-sort {
+  all: unset;
+  cursor: pointer;
+  display: inline-block;
+  width: 100%;
+}
+.th-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* When the browser is open it takes the whole workspace. */
 .app.files-open .editor-pane,
 .app.files-open .preview-pane,
@@ -627,12 +644,16 @@ button { font-family: inherit; }
   transition: opacity 0.1s;
 }
 .markdown-body :is(h1, h2, h3, h4, h5, h6):hover .anchor-link { opacity: 1; }
+/* Scroll a wide diagram rather than shrinking it: mermaid lays gantt charts
+   out at a fixed 1280px, which `max-width:100%` squeezed to ~35% in split
+   view — about 4px of label text. */
 .markdown-body .mermaid-figure {
-  display: flex;
-  justify-content: center;
+  display: block;
+  overflow-x: auto;
+  text-align: center;
   margin: 16px 0;
 }
-.markdown-body .mermaid-figure svg { max-width: 100%; height: auto; }
+.markdown-body .mermaid-figure svg { max-width: none; height: auto; }
 
 /* GitHub-style alerts */
 .markdown-body .md-alert {
@@ -866,14 +887,19 @@ kbd {
   .sidebar,
   .pane-divider,
   .editor-pane,
+  .files-view,
   .statusbar,
   .sidebar-toggle,
   .tip,
   .toast,
+  .ctx-menu,
   .modal,
   .modal-backdrop {
     display: none !important;
   }
+  /* The Files view hides the preview while it is open; printing from there
+     produced a PDF of the file table. Force the document back. */
+  .app.files-open .preview-pane { display: block !important; }
   html,
   body,
   .app,
@@ -893,10 +919,30 @@ kbd {
      (see setPrintLight), which keeps tables and syntax highlighting legible.
      This is only a fallback base colour for browsers without beforeprint. */
   .markdown-body { color: #1f2328; }
+  /* Horizontal scrolling is meaningless on paper: long code lines used to be
+     truncated mid-word at the page edge and simply lost. */
   .markdown-body pre,
+  .markdown-body pre code {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere;
+    overflow: visible !important;
+  }
   .markdown-body table,
+  .markdown-body .mermaid-figure { overflow: visible !important; }
+  /* Mermaid bakes its palette into the SVG. printPreview() re-renders in the
+     light theme, but the browser's own Ctrl+P can't wait for that, so force
+     readable ink and strokes as a fallback. */
+  .markdown-body .mermaid-figure text,
+  .markdown-body .mermaid-figure tspan { fill: #1f2328 !important; }
+  .markdown-body .mermaid-figure .edgePath path,
+  .markdown-body .mermaid-figure .flowchart-link,
+  .markdown-body .mermaid-figure marker path { stroke: #1f2328 !important; }
+  /* `break-inside: avoid` on a block taller than a page costs a blank page and
+     then breaks it anyway; keep it only for things that plausibly fit. */
   .markdown-body blockquote,
   .markdown-body .mermaid-figure { break-inside: avoid; }
+  .markdown-body pre,
+  .markdown-body table { break-inside: auto; orphans: 3; widows: 3; }
   .markdown-body h1,
   .markdown-body h2,
   .markdown-body h3 { break-after: avoid; }
@@ -912,6 +958,11 @@ kbd {
   /* Keep the whole status bar reachable instead of letting it overflow. */
   .statusbar { overflow-x: auto; gap: 10px; }
   .status-left, .status-right { flex-shrink: 0; }
+  /* Fingers need a target: these were 14px and 20px tall (WCAG 2.5.8 asks for
+     at least 24x24). */
+  .link-btn { padding: 6px 4px; min-height: 24px; }
+  .mode-btn { padding: 7px 12px; }
+  .th-sort { padding: 6px 0; }
 }
 
 /* Phones: give the header just enough room for the action buttons, and let the
@@ -919,11 +970,22 @@ kbd {
 @media (max-width: 560px) {
   .brand { display: none; }
   .app-header { gap: 8px; padding: 0 8px; }
-  .doc-title { flex: 1 1 40px; margin-left: 0; font-size: 13px; }
+  /* min-width keeps the filename editable: at 320px it collapsed to 30px, one
+     character wide. */
+  .doc-title { flex: 1 1 90px; min-width: 90px; margin-left: 0; font-size: 13px; }
   .header-actions { gap: 2px; }
   .header-actions .icon-btn { min-width: 28px; padding: 0 4px; }
   .google-btn { padding: 0 8px; gap: 5px; }
   .toolbar { padding: 0 6px; }
   /* Word/read/cursor counters are the first thing worth losing on a phone. */
   #stat-words, #stat-read, #cursor-pos { display: none; }
+}
+
+/* Very small phones (~320px): the header still has to fit Sign in, so the
+   filename gets less room — but never so little that it can't be edited. */
+@media (max-width: 400px) {
+  .doc-title { flex: 1 1 60px; min-width: 60px; }
+  .app-header { gap: 6px; padding: 0 6px; }
+  .header-actions .icon-btn { min-width: 26px; padding: 0 2px; }
+  .google-btn { padding: 0 6px; }
 }
