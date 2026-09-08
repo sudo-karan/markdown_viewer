@@ -7,9 +7,9 @@
  */
 // ?v= cache-buster: bump on every JS change (keep in sync with index.html's
 // script tag) so a deploy never leaves the browser on a stale module.
-import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908";
-import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908";
-import * as google from "./google.js?v=20260908";
+import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908b";
+import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908b";
+import * as google from "./google.js?v=20260908b";
 import LZString from "https://esm.sh/lz-string@1.5.0";
 
 const CONFIG = window.MO_STUDIO_CONFIG || {};
@@ -81,7 +81,6 @@ const state = {
   dark: true,
   renderTimer: 0,
   saveTimer: 0,
-  driveSaveTimer: 0,
   pendingDoc: null, // the doc the debounced autosave is holding, if any
   syncingScroll: false,
   driveRootId: null, // id of the "markdowns" root folder, once loaded
@@ -144,18 +143,22 @@ function applyTheme(dark) {
 /* ------------------------------------------------------------------ view mode */
 const isNarrow = () => window.matchMedia?.("(max-width: 720px)")?.matches === true;
 
-function setView(view) {
+function setView(view, { remember = true } = {}) {
   // There is no room for two panes on a phone — the stylesheet hides the editor
   // in split view — so "Split" stayed highlighted while only the preview showed,
-  // in a mode the user couldn't type into. Call it what it is.
-  if (view === "split" && isNarrow()) view = "preview";
-  state.view = view;
-  app.setAttribute("data-view", view);
+  // in a mode the user couldn't type into. Call it what it is, but remember what
+  // the user actually chose: persisting the coerced value meant one narrow
+  // window (or a transient desktop resize) permanently lost their Split setting.
+  const effective = view === "split" && isNarrow() ? "preview" : view;
+  state.view = effective;
+  app.setAttribute("data-view", effective);
   document.querySelectorAll(".mode-btn").forEach((b) => {
-    b.classList.toggle("is-active", b.dataset.view === view);
+    b.classList.toggle("is-active", b.dataset.view === effective);
   });
-  state.settings.view = view;
-  store.saveSettings(state.settings);
+  if (remember) {
+    state.settings.view = view;
+    store.saveSettings(state.settings);
+  }
 }
 
 /* ------------------------------------------------------------------ stats + cursor */
@@ -269,6 +272,10 @@ function updateStorageLoc() {
  * @returns {boolean} whether the write actually reached storage.
  */
 function persist(doc, { markSaved = true, rerender = true, touch = true } = {}) {
+  // A write queued before the document was deleted must not resurrect it:
+  // upsertDoc re-inserts any id it cannot find, so a pending autosave firing
+  // after a delete put the document straight back into the library.
+  if (deletedDocs.has(doc)) return true;
   if (touch) doc.updated = Date.now();
   state.library = upsertDoc(state.library, doc);
   const ok = store.saveLibrary(state.library);
@@ -289,13 +296,37 @@ function persist(doc, { markSaved = true, rerender = true, touch = true } = {}) 
   return ok;
 }
 
+/**
+ * Documents removed from the library. Held weakly and checked by persist() and
+ * the Drive push, so no timer armed before the delete can bring one back.
+ */
+const deletedDocs = new WeakSet();
+
+/** Forget a document: no queued write of any kind may touch it again. */
+function forgetDoc(doc) {
+  if (!doc) return;
+  deletedDocs.add(doc);
+  if (state.pendingDoc === doc) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = 0;
+    state.pendingDoc = null;
+  }
+  const t = driveSyncTimers.get(doc.id);
+  if (t) {
+    clearTimeout(t);
+    driveSyncTimers.delete(doc.id);
+  }
+}
+
 /** Commit a pending debounced autosave immediately. */
 function flushSave() {
-  if (!state.saveTimer) return;
-  clearTimeout(state.saveTimer);
-  state.saveTimer = 0;
-  if (state.pendingDoc) persist(state.pendingDoc, { rerender: false });
-  state.pendingDoc = null;
+  if (state.saveTimer) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = 0;
+    if (state.pendingDoc) persist(state.pendingDoc, { rerender: false });
+    state.pendingDoc = null;
+  }
+  flushDriveSyncs();
 }
 
 function loadDoc(doc) {
@@ -736,7 +767,12 @@ async function loadDriveFolder(folderId, { force = false } = {}) {
     files: [],
     loaded: false,
   });
-  if (c.loaded && !c.error && !force) return;
+  // A cached error must NOT auto-retry on every render. It used to, and since
+  // this function's `finally` repaints the Files view, which re-enters
+  // collectFileRows, which calls back in here — a single failing folder listing
+  // span an unbounded fetch loop (measured: 632 Drive requests in 3 seconds).
+  // Retrying is now explicit: the Refresh menu item, or re-expanding the row.
+  if (c.loaded && !force) return;
   c.loading = true;
   renderTree();
   try {
@@ -763,7 +799,8 @@ async function toggleDriveRoot() {
     if (!(await ensureDriveReady())) return;
     setExpanded(DRIVE_ROOT_KEY, true);
     renderTree();
-    await loadDriveFolder(state.driveRootId);
+    // Re-expanding is the user asking again, so a previous failure retries here.
+    await loadDriveFolder(state.driveRootId, { force: !!state.driveCache[state.driveRootId]?.error });
   } catch (e) {
     toast(e.message || "Could not reach Google Drive.", "error");
   }
@@ -772,7 +809,7 @@ async function toggleDriveFolder(folderId, key) {
   const willExpand = !isExpanded(key);
   setExpanded(key, willExpand);
   renderTree();
-  if (willExpand) await loadDriveFolder(folderId);
+  if (willExpand) await loadDriveFolder(folderId, { force: !!state.driveCache[folderId]?.error });
 }
 
 /* ---- local operations ---- */
@@ -856,6 +893,7 @@ function deleteLocalFolder(path) {
   );
   if (!confirm(`Delete folder "${path}" and its ${docs.length} document(s) from this browser?`)) return;
   const ids = new Set(docs.map((d) => d.id));
+  for (const d of docs) forgetDoc(d);
   state.library = state.library.filter((d) => !ids.has(d.id));
   state.settings.localFolders = localFolders().filter((p) => p !== path && !p.startsWith(path + "/"));
   // Drop the folder's expand state too. Leaving it behind grew the settings blob
@@ -1201,6 +1239,7 @@ async function deleteDriveFile(f, parentId) {
     if (c) c.files = c.files.filter((x) => x.id !== f.id);
     const doc = state.library.find((d) => d.driveId === f.id);
     if (doc) {
+      forgetDoc(doc); // a queued push would otherwise write into the trashed file
       state.library = removeDoc(state.library, doc.id);
       store.saveLibrary(state.library);
       if (state.current?.id === doc.id) {
@@ -1240,6 +1279,7 @@ async function deleteDriveFolder(f, parentId) {
     // Drive folder is gone), still open, still labelled "Drive: …", with Ctrl+S
     // writing into a trashed file. Keep them, as browser-only copies.
     const subtree = cachedDriveSubtree(f.id);
+    for (const id of subtree) driveTombstones.add(id);
     const fileIds = new Set(subtree.flatMap((id) => (state.driveCache[id]?.files || []).map((x) => x.id)));
     let rescued = 0;
     for (const doc of state.library) {
@@ -1290,6 +1330,7 @@ async function moveDrive(dragData, targetId) {
 
 function deleteDoc(doc) {
   if (!confirm(`Delete "${doc.name}"? This only removes it from this browser.`)) return;
+  forgetDoc(doc);
   state.library = removeDoc(state.library, doc.id);
   store.saveLibrary(state.library);
   if (state.current?.id === doc.id) {
@@ -1315,6 +1356,13 @@ const filesState = {
   dir: 1,
 };
 const filesHere = () => filesState.trail[filesState.trail.length - 1] || null;
+
+/**
+ * Drive folders this session actually deleted. The Files-view breadcrumb needs
+ * to tell "deleted" apart from "not listed yet" — everything else is unknown,
+ * not gone.
+ */
+const driveTombstones = new Set();
 
 /**
  * Roll a local folder's contents up into the numbers the details table shows:
@@ -1488,10 +1536,15 @@ function pruneFilesTrail() {
   const before = filesState.trail.length;
   while (filesState.trail.length) {
     const here = filesState.trail[filesState.trail.length - 1];
+    // A Drive folder is "gone" only when we actually deleted it. Treating an
+    // absent cache entry as deletion made every Drive subfolder unreachable:
+    // listing a parent stores its children in the parent's entry without
+    // creating one of their own, and this runs before collectFileRows has had
+    // the chance to load it — so navigating in popped the entry immediately.
     const gone =
       here.source === "local"
-        ? here.path && !localNodeAt(here.path)
-        : here.folderId && !state.driveCache[here.folderId];
+        ? !!here.path && !localNodeAt(here.path)
+        : !!here.folderId && driveTombstones.has(here.folderId);
     if (!gone) break;
     filesState.trail.pop();
   }
@@ -1517,6 +1570,7 @@ async function renderFiles() {
     rows = await collectFileRows();
   } catch (e) {
     if (seq !== filesRenderSeq) return;
+    filesFocusFirstRow = false;
     body.innerHTML = "";
     const tr = document.createElement("tr");
     tr.innerHTML = `<td colspan="5" class="files-empty"></td>`;
@@ -1534,10 +1588,12 @@ async function renderFiles() {
     th.setAttribute("aria-sort", active ? (filesState.dir > 0 ? "ascending" : "descending") : "none");
   });
   if (!rows.length) {
+    filesFocusFirstRow = false;
     body.innerHTML = `<tr><td colspan="5" class="files-empty">This folder is empty.</td></tr>`;
     return;
   }
   if (rows.length === 1 && (rows[0].kind === "note" || rows[0].kind === "error")) {
+    filesFocusFirstRow = false;
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.colSpan = 5;
@@ -1710,24 +1766,51 @@ function onEdit() {
  * typing is one upload, and silent about an expired session (the status bar
  * already shows the document is behind).
  */
+// One debounce PER DOCUMENT. A single shared timer meant that editing a second
+// Drive document cancelled the first one's pending upload outright — its edits
+// stayed in this browser while the status bar claimed they were syncing.
+const driveSyncTimers = new Map();
+
 function scheduleDriveSync(doc) {
   if (!doc?.driveId || !google.isConfigured() || !google.hasSession()) return;
-  clearTimeout(state.driveSaveTimer);
-  state.driveSaveTimer = setTimeout(async () => {
-    state.driveSaveTimer = 0;
-    try {
-      await google.drive.update(doc.driveId, doc.text || "");
-      doc.driveSyncedAt = Date.now();
-      // touch:false — this is the same content, not a new edit.
-      persist(doc, { markSaved: false, rerender: false, touch: false });
-      if (doc.id === state.current?.id) updateStorageLoc();
-    } catch (e) {
-      if (doc.id === state.current?.id) {
-        storageLoc.textContent = `Drive: ${doc.name} · not synced`;
-        storageLoc.title = e?.message || "The Google Drive copy could not be updated";
-      }
+  clearTimeout(driveSyncTimers.get(doc.id));
+  driveSyncTimers.set(
+    doc.id,
+    setTimeout(() => {
+      driveSyncTimers.delete(doc.id);
+      pushToDrive(doc);
+    }, 2500),
+  );
+}
+
+/** Send a Drive-backed document's current text to Drive. */
+async function pushToDrive(doc) {
+  if (!doc?.driveId || deletedDocs.has(doc)) return;
+  try {
+    await google.drive.update(doc.driveId, doc.text || "");
+    if (deletedDocs.has(doc)) return; // deleted while the request was in flight
+    doc.driveSyncedAt = Date.now();
+    // touch:false — this is the same content, not a new edit.
+    persist(doc, { markSaved: false, rerender: false, touch: false });
+    if (doc.id === state.current?.id) updateStorageLoc();
+  } catch (e) {
+    if (doc.id === state.current?.id) {
+      storageLoc.textContent = `Drive: ${doc.name} · not synced`;
+      storageLoc.title = e?.message || "The Google Drive copy could not be updated";
     }
-  }, 2500);
+  }
+}
+
+/** Send every pending Drive edit now — on doc switch, page hide, sign-out. */
+function flushDriveSyncs() {
+  if (!driveSyncTimers.size) return;
+  const ids = [...driveSyncTimers.keys()];
+  for (const id of ids) {
+    clearTimeout(driveSyncTimers.get(id));
+    driveSyncTimers.delete(id);
+    const doc = state.library.find((d) => d.id === id);
+    if (doc) pushToDrive(doc); // fire and forget: the local copy is already safe
+  }
 }
 
 /* ------------------------------------------------------------------ Google Drive */
@@ -1777,6 +1860,11 @@ async function saveToDrive(targetFolderId) {
       state.current.name = res.name || name;
       state.current.driveName = res.name || name;
       docTitle.value = state.current.name;
+      // Binding a document to Drive takes it out of the local tree, so the row
+      // has to appear on the Drive side in the same breath — otherwise saving
+      // made the document vanish from both views until a reload.
+      cacheDriveFile(state.current.driveParentId, res);
+      revealDriveFolder(state.current.driveParentId);
     }
     state.current.driveSyncedAt = Date.now();
     persist(state.current);
@@ -1796,6 +1884,16 @@ async function openDriveFile(f, parentId) {
     // Reuse an existing local doc bound to this Drive file, if any.
     const existing = state.library.find((d) => d.driveId === f.id);
     if (existing) {
+      // Re-reading Drive over unsynced local edits destroys them. If this copy
+      // is ahead of Drive, let the user decide.
+      const ahead = (existing.updated || 0) > (existing.driveSyncedAt || 0) && existing.text !== text;
+      if (ahead && !confirm(
+        `"${existing.name}" has changes in this browser that aren't in Drive yet.\n\n` +
+          "Replace them with the Drive version? (Cancel keeps your local copy.)",
+      )) {
+        loadDoc(existing);
+        return;
+      }
       existing.text = text;
       existing.name = f.name;
       existing.driveName = f.name;
@@ -2139,11 +2237,12 @@ function surround(before, after = before, placeholder = "") {
 
   // A second press removes the markers instead of nesting them: pressing Bold
   // twice used to leave `**hello****bold text**`.
-  if (hadSelection && sel.startsWith(before) && sel.endsWith(after) && sel.length >= before.length + after.length) {
+  if (after && hadSelection && sel.startsWith(before) && sel.endsWith(after) && sel.length >= before.length + after.length) {
     const inner = sel.slice(before.length, sel.length - after.length);
     return replaceRange(inner, start, end, start, start + inner.length);
   }
   if (
+    after &&
     value.slice(Math.max(0, start - before.length), start) === before &&
     value.slice(end, end + after.length) === after
   ) {
@@ -2160,6 +2259,19 @@ function surround(before, after = before, placeholder = "") {
   replaceRange(text, start, end, hadSelection ? selStart : selStart, hadSelection ? selEnd : selEnd);
 }
 
+/**
+ * Line-prefix buttons that belong to a family. `exact` means "this line already
+ * IS this style" (press again to remove it); `family` is the whole marker to
+ * strip or replace, so switching within a family converts rather than stacks.
+ */
+const LINE_PREFIX_RULES = {
+  "# ": { family: /^#{1,6} /, exact: /^# (?!#)/ },
+  "## ": { family: /^#{1,6} /, exact: /^## (?!#)/ },
+  "> ": { family: /^> ?/, exact: /^> / },
+  "- ": { family: /^[-*+] (?:\[[ xX]\] )?/, exact: /^[-*+] (?!\[[ xX]\] )/ },
+  "- [ ] ": { family: /^[-*+] (?:\[[ xX]\] )?/, exact: /^[-*+] \[[ xX]\] / },
+};
+
 function prefixLines(prefix) {
   const start = editor.selectionStart;
   const end = editor.selectionEnd;
@@ -2172,13 +2284,20 @@ function prefixLines(prefix) {
   const blockEnd = end > lineStart && value[end - 1] === "\n" ? end - 1 : end;
   const block = value.slice(lineStart, blockEnd);
   const lines = block.split("\n");
-  const plain = typeof prefix !== "function";
-  // Pressing the same button again removes the prefix rather than stacking it
-  // ("# # heading").
-  const allPrefixed = plain && lines.every((l) => l.startsWith(prefix));
-  const replaced = lines
-    .map((l, i) => (allPrefixed ? l.slice(prefix.length) : typeof prefix === "function" ? prefix(l, i) : prefix + l))
-    .join("\n");
+  const rule = typeof prefix === "function" ? null : LINE_PREFIX_RULES[prefix];
+  let replaced;
+  if (rule && lines.every((l) => rule.exact.test(l))) {
+    // Already exactly this — a second press turns it off ("# # heading" was the
+    // old behaviour).
+    replaced = lines.map((l) => l.replace(rule.family, "")).join("\n");
+  } else if (rule && lines.every((l) => rule.family.test(l))) {
+    // A different member of the same family — convert instead of stacking.
+    // "- " is a prefix of "- [ ] ", so the naive version either destroyed a
+    // checklist ("[ ] item") or doubled the marker ("- - [ ] item").
+    replaced = lines.map((l) => l.replace(rule.family, prefix)).join("\n");
+  } else {
+    replaced = lines.map((l, i) => (typeof prefix === "function" ? prefix(l, i) : prefix + l)).join("\n");
+  }
   // Keep the lines selected so actions can be chained (bullet, then quote).
   replaceRange(replaced, lineStart, blockEnd, lineStart, lineStart + replaced.length);
 }
@@ -2304,9 +2423,17 @@ function lineToEditorTop(line) {
 function previewAnchors() {
   const base = previewPane.getBoundingClientRect().top - previewPane.scrollTop;
   const out = [];
+  // The interpolation assumes line numbers rise with position on screen. Most
+  // blocks satisfy that, but a renderer that moves content (footnote
+  // definitions are relocated to the end while keeping their original map) can
+  // emit an anchor that points backwards, which would yank the editor to the
+  // top. Keep the sequence monotonic rather than trusting every stamp.
+  let maxLine = -Infinity;
   for (const el of preview.querySelectorAll("[data-source-line]")) {
     const line = Number(el.getAttribute("data-source-line"));
-    if (Number.isFinite(line)) out.push({ line, top: el.getBoundingClientRect().top - base });
+    if (!Number.isFinite(line) || line < maxLine) continue;
+    maxLine = line;
+    out.push({ line, top: el.getBoundingClientRect().top - base });
   }
   return out;
 }
@@ -2473,8 +2600,15 @@ body{margin:0;background:${state.dark ? "#0d1117" : "#fff"}}
  * and so a blank document doesn't export the app's own "This document is blank"
  * placeholder as if it were content.
  */
-function exportableHtml() {
-  return editor.value.trim() ? renderMarkdown(editor.value) : "";
+async function exportableHtml() {
+  if (!editor.value.trim()) return "";
+  // Render through the preview so the export gets the enhance() pass too:
+  // rendering the Markdown alone shipped raw ```mermaid source and literal
+  // [!NOTE] markers. Flushing the debounce also stops a click within 180ms of
+  // a keystroke exporting the previous version.
+  clearTimeout(state.renderTimer);
+  await renderNow();
+  return preview.innerHTML;
 }
 
 function docBaseName() {
@@ -2519,24 +2653,29 @@ async function printPreview() {
   // (A second enhance() alone can't do it: the mermaid source block has already
   // been replaced by its figure, so the whole preview has to be re-rendered.)
   const wasDark = state.dark;
-  if (wasDark) {
-    setPrintLight(true);
-    state.dark = false;
-    await renderNow();
-  }
-  window.print();
-  if (wasDark) {
-    state.dark = true;
-    setPrintLight(false);
-    await renderNow();
+  try {
+    if (wasDark) {
+      setPrintLight(true);
+      state.dark = false;
+      await renderNow();
+    }
+    window.print();
+  } finally {
+    // Without this, a throw anywhere above left the app in the print theme with
+    // state.dark out of step, so the theme toggle appeared dead for one click.
+    if (wasDark) {
+      state.dark = true;
+      setPrintLight(false);
+      await renderNow();
+    }
   }
 }
 
-function doExport(kind) {
+async function doExport(kind) {
   closeModals();
   const name = docBaseName();
   if (kind === "print") return printPreview();
-  const html = exportableHtml();
+  const html = await exportableHtml();
   if (kind !== "md" && !html) {
     toast("This document is blank — nothing to export", "error");
     return;
@@ -2613,8 +2752,15 @@ function openModal(id) {
     $("set-client-id").value = state.settings.googleClientId || CONFIG.googleClientId || "";
   }
   app.inert = true;
-  const first = modal.querySelector("input, textarea, select, button:not([data-close])");
-  (first || modal).focus?.();
+  const first =
+    modal.querySelector("input, textarea, select, button:not([data-close])") ||
+    modal.querySelector("button, [href], [tabindex]:not([tabindex='-1'])");
+  if (first) {
+    first.focus();
+  } else {
+    modal.tabIndex = -1;
+    modal.focus();
+  }
 }
 function closeModals() {
   $("modal-backdrop").hidden = true;
@@ -2924,7 +3070,9 @@ function wireEvents() {
   // so the cached per-line offsets used for scroll sync must be rebuilt.
   window.addEventListener("resize", () => {
     invalidateLineOffsets();
-    if (state.view === "split" && isNarrow()) setView("preview");
+    // Re-apply the *saved* preference at the new width, so widening the window
+    // brings Split back instead of leaving the coerced Preview behind.
+    setView(state.settings.view || "split", { remember: false });
   });
 
   // Reloading or closing the tab within the 500ms autosave debounce used to
@@ -2947,10 +3095,15 @@ function wireEvents() {
     if (!Number.isFinite(line)) return;
     const lines = editor.value.split("\n");
     const src = lines[line];
-    if (src == null || !/^\s*[-*+]\s+\[[ xX]\]/.test(src)) return;
-    lines[line] = src.replace(/\[[ xX]\]/, box.checked ? "[x]" : "[ ]");
-    editor.value = lines.join("\n");
-    onEdit();
+    // Ordered ("1. [ ]") and block-quoted ("> - [ ]") task items are task items
+    // too; they used to tick and then silently revert on the next render.
+    if (src == null || !/^\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+\[[ xX]\]/.test(src)) return;
+    // Rewrite through replaceRange so the change joins the textarea's own undo
+    // history instead of wiping it.
+    let start = 0;
+    for (let i = 0; i < line; i++) start += lines[i].length + 1;
+    const box0 = src.indexOf("[");
+    replaceRange(box.checked ? "[x]" : "[ ]", start + box0, start + box0 + 3, editor.selectionStart, editor.selectionEnd);
   });
 }
 

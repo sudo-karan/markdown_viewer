@@ -85,6 +85,9 @@ function announceAccount() {
   const id = getAccountId();
   if (id === lastAnnounced) return;
   lastAnnounced = id;
+  // The app root folder belongs to whoever was signed in; a new identity must
+  // resolve its own rather than inherit the previous account's folder id.
+  folderId = null;
   try {
     accountListener?.(id);
   } catch (e) {
@@ -117,8 +120,15 @@ function dropStore(store, key) {
   }
 }
 function persistToken() {
-  if (accessToken) writeStore("sessionStorage", TOKEN_KEY, { t: accessToken, e: tokenExpiry });
-  else dropStore("sessionStorage", TOKEN_KEY);
+  // The owner is stored with the token. Without it a tab that had signed in as
+  // one account left a usable token behind in its sessionStorage, and a later
+  // session in that tab — remembering a DIFFERENT account in localStorage —
+  // adopted it and wrote to the wrong person's Drive.
+  if (accessToken) {
+    writeStore("sessionStorage", TOKEN_KEY, { t: accessToken, e: tokenExpiry, a: getAccountId() });
+  } else {
+    dropStore("sessionStorage", TOKEN_KEY);
+  }
 }
 function persistAccount() {
   if (profile) writeStore("localStorage", ACCOUNT_KEY, profile);
@@ -192,7 +202,8 @@ export function getAccountId() {
 export function restoreSession() {
   if (!profile) profile = readStore("localStorage", ACCOUNT_KEY);
   const cached = readStore("sessionStorage", TOKEN_KEY);
-  if (cached?.t && Date.now() < Number(cached.e || 0)) {
+  const ownedByUs = !!profile && cached?.a === getAccountId();
+  if (ownedByUs && cached?.t && Date.now() < Number(cached.e || 0)) {
     accessToken = cached.t;
     tokenExpiry = Number(cached.e);
     scheduleRefresh();
@@ -221,6 +232,10 @@ export async function resumeSession() {
 // The GIS token client's callback/error_callback are set once at init time and
 // cannot be refreshed per request, so they must resolve the *current* pending
 // request rather than close over one promise. We track it in `pending`.
+// Bumped by signOut() and by any identity change. A GIS callback carrying an
+// older generation is stale: sign-out used to be silently undone by a refresh
+// that was already in flight when the user clicked it.
+let authGeneration = 0;
 let pending = null;
 function settlePending(fn) {
   const p = pending;
@@ -232,6 +247,9 @@ function settlePending(fn) {
 function onTokenResponse(resp) {
   settlePending((p) => {
     if (resp.error) return p.reject(new Error(resp.error_description || resp.error));
+    if (p.generation !== authGeneration) {
+      return p.reject(new Error("That Google sign-in was superseded."));
+    }
     accessToken = resp.access_token;
     tokenExpiry = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
     persistToken();
@@ -265,7 +283,7 @@ function requestToken({ prompt, hint } = {}) {
       () => settlePending((p) => p.reject(new Error("Google sign-in timed out. Please try again."))),
       REQUEST_TIMEOUT_MS,
     );
-    pending = { resolve, reject, timer };
+    pending = { resolve, reject, timer, generation: authGeneration };
     const opts = {};
     if (prompt !== undefined) opts.prompt = prompt;
     if (hint) opts.hint = hint;
@@ -330,12 +348,14 @@ export async function signIn() {
     await requestToken({ prompt: "consent" });
     await loadProfile();
   } catch (e) {
-    profile = null;
+    // Do NOT forget the account here. Closing the popup, or a momentary
+    // network failure, is not a request to sign out — clearing the profile
+    // swapped the whole library back to the signed-out one and looked like
+    // data loss. The token is dropped; hasSession() stays true and the UI
+    // shows "reconnect" until the user says otherwise.
     accessToken = null;
     tokenExpiry = 0;
     persistToken();
-    persistAccount();
-    announceAccount();
     throw e;
   }
   persistAccount();
@@ -344,6 +364,9 @@ export async function signIn() {
 }
 
 export function signOut() {
+  authGeneration++; // any in-flight token request is now stale
+  silentPromise = null;
+  if (pending) settlePending((p) => p.reject(new Error("Signed out.")));
   clearTimeout(refreshTimer);
   if (accessToken && window.google?.accounts?.oauth2) {
     try {
