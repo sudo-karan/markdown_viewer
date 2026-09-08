@@ -7,9 +7,9 @@
  */
 // ?v= cache-buster: bump on every JS change (keep in sync with index.html's
 // script tag) so a deploy never leaves the browser on a stale module.
-import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908b";
-import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908b";
-import * as google from "./google.js?v=20260908b";
+import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908c";
+import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908c";
+import * as google from "./google.js?v=20260908c";
 import LZString from "https://esm.sh/lz-string@1.5.0";
 
 const CONFIG = window.MO_STUDIO_CONFIG || {};
@@ -278,7 +278,7 @@ function persist(doc, { markSaved = true, rerender = true, touch = true } = {}) 
   // after a delete put the document straight back into the library.
   if (deletedDocs.has(doc)) return true;
   if (touch) doc.updated = Date.now();
-  state.library = upsertDoc(state.library, doc);
+  state.library = upsertDoc(mergeWithStored(state.library, doc.id), doc);
   const ok = store.saveLibrary(state.library);
   // Only the document on screen owns the "reopen this next time" pointer.
   // Renaming or moving a background document used to steal it, so the next
@@ -305,6 +305,7 @@ function persist(doc, { markSaved = true, rerender = true, touch = true } = {}) 
  * @returns {boolean}
  */
 function saveLibrary() {
+  state.library = mergeWithStored(state.library);
   const ok = store.saveLibrary(state.library);
   if (!ok) {
     setSaveState("error");
@@ -318,11 +319,49 @@ function saveLibrary() {
  * the Drive push, so no timer armed before the delete can bring one back.
  */
 const deletedDocs = new WeakSet();
+// Same set, by id — the merge below works on plain objects read back from
+// storage, which are never the same object as the one that was deleted.
+const deletedIds = new Set();
+
+/**
+ * Reconcile the in-memory library with whatever is in storage right now.
+ *
+ * Both writers below replace the whole storage key with `state.library`, which
+ * is a snapshot taken when this tab loaded. Nothing re-reads it and nothing
+ * listens for the `storage` event, so a second tab of the same app — or any
+ * later writer — had its documents silently destroyed by the next keystroke
+ * here. Merging by id before every write makes the last writer win only for
+ * the document it actually touched.
+ *
+ * @param {string} [writingId] the document this write is about; ours wins for it
+ */
+function mergeWithStored(lib, writingId) {
+  let stored;
+  try {
+    stored = store.loadLibrary();
+  } catch {
+    return lib;
+  }
+  if (!stored.length) return lib;
+  const ours = new Map(lib.map((d) => [d.id, d]));
+  const out = lib.slice();
+  for (const s of stored) {
+    if (deletedIds.has(s.id)) continue; // we deleted it; do not resurrect
+    const mine = ours.get(s.id);
+    if (!mine) {
+      out.push(s); // created by another writer since we loaded
+    } else if (s.id !== writingId && (s.updated || 0) > (mine.updated || 0)) {
+      Object.assign(mine, s); // another writer has a newer copy we are not editing
+    }
+  }
+  return out;
+}
 
 /** Forget a document: no queued write of any kind may touch it again. */
 function forgetDoc(doc) {
   if (!doc) return;
   deletedDocs.add(doc);
+  deletedIds.add(doc.id);
   if (state.pendingDoc === doc) {
     clearTimeout(state.saveTimer);
     state.saveTimer = 0;
@@ -435,8 +474,10 @@ function localFolders() {
 /* ---- context menu ---- */
 let ctxEl = null;
 function closeContextMenu() {
+  const returnTo = ctxEl?.__opener;
   ctxEl?.remove();
   ctxEl = null;
+  if (returnTo?.isConnected) returnTo.focus();
   document.removeEventListener("click", onCtxOutside, true);
 }
 function onCtxOutside(e) {
@@ -446,6 +487,7 @@ function openContextMenu(x, y, items) {
   closeContextMenu();
   ctxEl = document.createElement("div");
   ctxEl.className = "ctx-menu";
+  ctxEl.__opener = document.activeElement;
   for (const [label, fn, danger] of items) {
     const b = document.createElement("button");
     if (danger) b.className = "danger";
@@ -467,6 +509,23 @@ function openContextMenu(x, y, items) {
   ctxEl.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + "px";
   ctxEl.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
   ctxEl.style.visibility = "";
+  // Move focus into the menu, or its items are unreachable by keyboard — and
+  // tabbing towards it just typed spaces into the document instead.
+  ctxEl.querySelector("button")?.focus();
+  ctxEl.addEventListener("keydown", (e) => {
+    const items = [...ctxEl.querySelectorAll("button")];
+    const i = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const next = (i + (e.key === "ArrowDown" ? 1 : items.length - 1) + items.length) % items.length;
+      items[next]?.focus();
+    } else if (e.key === "Tab") {
+      // Keep Tab inside the menu; Escape is the way out (see onShortcut).
+      e.preventDefault();
+      const next = (i + (e.shiftKey ? items.length - 1 : 1) + items.length) % items.length;
+      items[next]?.focus();
+    }
+  });
   setTimeout(() => document.addEventListener("click", onCtxOutside, true), 0);
 }
 
@@ -524,10 +583,33 @@ function makeRow(o) {
     });
   }
 
-  row.addEventListener("click", (e) => {
-    if (e.target.closest(".tree-kebab")) return;
+  const activate = () => {
     if (o.onActivate) o.onActivate();
     else if (o.onToggle) o.onToggle();
+  };
+  row.addEventListener("click", (e) => {
+    if (e.target.closest(".tree-kebab")) return;
+    activate();
+  });
+  // These rows declare role="treeitem" but had no tabindex and no key handling,
+  // so a keyboard user could not open a document or expand a folder at all.
+  row.tabIndex = 0;
+  row.addEventListener("keydown", (e) => {
+    if (e.target.closest(".tree-kebab")) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      activate();
+    } else if (e.key === "ArrowRight" && o.twisty && !o.expandedFlag) {
+      e.preventDefault();
+      o.onToggle?.();
+    } else if (e.key === "ArrowLeft" && o.twisty && o.expandedFlag) {
+      e.preventDefault();
+      o.onToggle?.();
+    } else if (o.menu && (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10"))) {
+      e.preventDefault();
+      const r = row.getBoundingClientRect();
+      openContextMenu(r.left, r.bottom + 2, o.menu(row));
+    }
   });
 
   if (o.dragData) {
@@ -662,7 +744,12 @@ function driveFolderMenu(folderId, parentId, folder) {
   const items = [
     ["New file", () => newFileDrive(folderId)],
     ["New folder", () => newFolderDrive(folderId)],
-    ["Refresh", () => loadDriveFolder(folderId, { force: true })],
+    ["Refresh", () => {
+      // Also forget any tombstone: a folder restored from the Drive trash was
+      // otherwise permanently unreachable in the Files view.
+      driveTombstones.delete(folderId);
+      loadDriveFolder(folderId, { force: true });
+    }],
     ["Open in Drive", () => window.open(google.drive.folderUrl(folderId), "_blank", "noopener")],
   ];
   if (folder) {
@@ -1033,6 +1120,10 @@ async function moveLocalDocToDrive(dragData, targetFolderId) {
  * never been expanded landed in an empty cache entry and simply wasn't shown.
  */
 function revealDriveFolder(folderId) {
+  // Expanding Drive without a resolved folder leaves the branch on a "Loading…"
+  // hint with no loader behind it, and the document — now Drive-bound — has
+  // already left the local tree, so it is visible nowhere.
+  if (!folderId && !state.driveRootId) return;
   setExpanded(DRIVE_ROOT_KEY, true);
   // Guard against `null`: comparing an unresolved root id used to write a bogus
   // `D:<rootId>` expand key for the root folder itself.
@@ -1084,7 +1175,7 @@ async function copyDriveFileToLocal(dragData, targetPath) {
       folder: targetPath || "", created: now, updated: now,
     };
     state.library = upsertDoc(state.library, doc);
-    saveLibrary();
+    if (!saveLibrary()) return;
     setExpanded(LOCAL_ROOT_KEY, true);
     if (targetPath) setExpanded("L:" + targetPath, true);
     refreshViews();
@@ -1102,9 +1193,25 @@ async function copyDriveFileToLocal(dragData, targetPath) {
  * between folders, and no way for a keyboard user either. This drives a
  * "Move to…" menu that reaches the same handlers as a drop.
  */
+/**
+ * Every local folder path that exists, whether it was recorded in settings or is
+ * merely implied by a document's `folder`. Adopting a library on first sign-in
+ * copies the documents but not settings.localFolders, so the settings list alone
+ * omitted folders both views were visibly showing.
+ */
+function allLocalFolderPaths() {
+  const paths = new Set(localFolders());
+  for (const d of state.library) {
+    if (d.driveId || !d.folder) continue;
+    const segs = d.folder.split("/");
+    for (let i = 1; i <= segs.length; i++) paths.add(segs.slice(0, i).join("/"));
+  }
+  return [...paths].filter(Boolean).sort();
+}
+
 function moveDestinations() {
   const out = [{ label: "This browser", target: { source: "local", path: "" } }];
-  for (const path of [...localFolders()].sort()) {
+  for (const path of allLocalFolderPaths()) {
     const depth = path.split("/").length;
     out.push({ label: "\u00a0\u00a0".repeat(depth) + path.split("/").pop(), target: { source: "local", path } });
   }
@@ -1208,7 +1315,9 @@ async function importFilesInto(fileList, target, { openSingle = false } = {}) {
         state.library = upsertDoc(state.library, lastLocalDoc);
         ok++;
       }
-      saveLibrary();
+      // Do not report a green "Imported N of N" over a refused write —
+      // saveLibrary() has already said what went wrong.
+      if (!saveLibrary()) return;
       setExpanded(LOCAL_ROOT_KEY, true);
       if (folder) setExpanded("L:" + folder, true);
     }
@@ -1386,12 +1495,21 @@ async function deleteDriveFolder(f, parentId) {
     ? [...scan.fileIds].filter((id) => state.library.some((d) => d.driveId === id)).length
     : 0;
   // Say what is actually about to happen, now that we know.
-  const detail = scan
+  const contents = scan
     ? `${scan.fileIds.size} file${scan.fileIds.size === 1 ? "" : "s"}` +
-      (scan.folders.length > 1 ? ` in ${scan.folders.length} folders` : "") +
-      (affected ? `; ${affected} open here will be kept in this browser` : "")
+      (scan.folders.length > 1 ? ` in ${scan.folders.length} folders` : "")
     : "its contents";
-  if (!confirm(`Move folder "${f.name}" and ${detail} to the Google Drive trash?`)) return;
+  let message = `Move folder "${f.name}" and ${contents} to the Google Drive trash?`;
+  if (affected) {
+    message += `\n\n${affected} document${affected === 1 ? "" : "s"} open here will be kept in this browser.`;
+  }
+  if (!scan) {
+    // Be explicit rather than quietly stranding documents we could not see.
+    message +=
+      "\n\nWarning: the folder's contents could not be listed, so documents inside" +
+      " subfolders may be left pointing at trashed files.";
+  }
+  if (!confirm(message)) return;
   try {
     await google.drive.trash(f.id);
     const c = state.driveCache[parentId];
@@ -1580,7 +1698,9 @@ async function collectFileRows() {
   if (!(await ensureDriveReady())) return [];
   const folderId = here.folderId || state.driveRootId;
   if (!here.folderId) here.folderId = folderId;
-  await loadDriveFolder(folderId);
+  // Navigating in is the user asking again, so a previous failure retries here
+  // instead of showing the stale error for the rest of the session.
+  await loadDriveFolder(folderId, { force: !!state.driveCache[folderId]?.error });
   const c = state.driveCache[folderId];
   if (!c) return [];
   if (c.error) return [{ kind: "error", name: c.error }];
@@ -1792,6 +1912,10 @@ async function renderFiles() {
         go();
       });
       tr.addEventListener("keydown", (e) => {
+        // The kebab is a button inside the row; without this its Enter/Space
+        // bubbled up and opened the file instead of its menu, so Rename / Move
+        // to… / Delete were unreachable without a mouse.
+        if (e.target.closest(".tree-kebab")) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           go();
@@ -1897,6 +2021,8 @@ function onEdit() {
 // Drive document cancelled the first one's pending upload outright — its edits
 // stayed in this browser while the status bar claimed they were syncing.
 const driveSyncTimers = new Map();
+// Documents with a "Save to Drive" already on the wire.
+const savingToDrive = new Set();
 
 function scheduleDriveSync(doc) {
   if (!doc?.driveId || !google.isConfigured() || !google.hasSession()) return;
@@ -1913,9 +2039,15 @@ function scheduleDriveSync(doc) {
 /** Send a Drive-backed document's current text to Drive. */
 async function pushToDrive(doc) {
   if (!doc?.driveId || deletedDocs.has(doc)) return;
+  // Whose library this document belongs to, before the await. Signing out (or
+  // switching accounts) mid-upload used to land the continuation's persist() in
+  // whatever library was loaded by then — copying a private Drive document into
+  // the shared signed-out library, where the next person to sign in adopted it.
+  const account = getAccount();
   try {
     await google.drive.update(doc.driveId, doc.text || "");
     if (deletedDocs.has(doc)) return; // deleted while the request was in flight
+    if (getAccount() !== account) return; // the account changed under us
     doc.driveSyncedAt = Date.now();
     // touch:false — this is the same content, not a new edit.
     persist(doc, { markSaved: false, rerender: false, touch: false });
@@ -1965,6 +2097,10 @@ async function saveToDrive(targetFolderId) {
   // the user was looking at when they pressed the button.
   const target = state.current;
   if (!target) return;
+  // A second press while the first upload is on the wire used to create a second
+  // Drive file and orphan one of them.
+  if (savingToDrive.has(target.id)) return;
+  savingToDrive.add(target.id);
   setSaveState("saving");
   try {
     // Must go through ensureSignedIn, not google.signIn: signing in here without
@@ -2019,10 +2155,21 @@ async function saveToDrive(targetFolderId) {
   } catch (e) {
     setSaveState("error");
     reportDriveError(e, "Google Drive save failed");
+  } finally {
+    savingToDrive.delete(target.id);
   }
 }
 
 async function openDriveFile(f, parentId) {
+  // Commit anything still in the autosave debounce before we go and read the
+  // remote copy, and don't re-read at all for the document already on screen —
+  // clicking its own row threw away the last 500ms of typing.
+  flushSave();
+  const already = state.library.find((d) => d.driveId === f.id);
+  if (already && state.current?.id === already.id) {
+    closeModals();
+    return;
+  }
   try {
     const text = await google.drive.read(f.id);
     closeModals();
@@ -2133,7 +2280,9 @@ function reloadForAccount() {
   }
 
   if (state.settings.theme) applyTheme(state.settings.theme === "dark");
-  setView(state.settings.view || state.view);
+  // remember:false — signing in on a phone coerces split→preview, and persisting
+  // that wrote "preview" into the account, hiding the editor on every device.
+  setView(state.settings.view || state.view, { remember: false });
   const collapsed = !!state.settings.sidebarCollapsed;
   app.classList.toggle("sidebar-collapsed", collapsed);
   $("sidebar-toggle").setAttribute("aria-expanded", String(!collapsed));
@@ -2171,6 +2320,11 @@ function switchAccount(id) {
     return "";
   }
   flushSave();
+  // A breadcrumb pointing into Drive makes the next render call ensureDriveReady,
+  // which signs straight back in — so signing out bounced immediately back to
+  // signed in. Drive locations belong to the account that is going away.
+  if (filesState.trail.some((t) => t.source === "drive")) filesState.trail = [];
+  driveTombstones.clear();
   let note = "";
   if (id) {
     const anonLib = store.loadLibraryOf("anon");
@@ -2445,7 +2599,16 @@ function prefixLines(prefix, explicitRule) {
   // Slicing to `end` kept the trailing "\n", so the split produced an extra
   // empty entry that got prefixed and merged into the following line — which is
   // how "select two lines, make a numbered list" renumbered a third one.
-  const blockEnd = end > lineStart && value[end - 1] === "\n" ? end - 1 : end;
+  // With a collapsed caret the old range was empty, so `lines` was [""] — which
+  // matches no rule, so every button ADDED a marker and "# Title" became
+  // "# # Title" instead of toggling. A caret formats the line it sits on.
+  let blockEnd;
+  if (start === end) {
+    const nl = value.indexOf("\n", start);
+    blockEnd = nl === -1 ? value.length : nl;
+  } else {
+    blockEnd = end > lineStart && value[end - 1] === "\n" ? end - 1 : end;
+  }
   const block = value.slice(lineStart, blockEnd);
   const lines = block.split("\n");
   const rule = explicitRule || (typeof prefix === "function" ? null : LINE_PREFIX_RULES[prefix]);
@@ -2485,7 +2648,10 @@ function insertBlock(text, caret) {
   // Selected text is content, not something to throw away: keep it inside the
   // block when the template has a place for it, otherwise put it back after.
   const selected = value.slice(start, end);
-  const body = selected && caret != null ? text.slice(0, caret) + selected + text.slice(caret) : text;
+  // Templates with a caret slot take the selection into it; the rest append it
+  // after the block. Either way it survives — Image and Horizontal rule used to
+  // delete whatever was selected.
+  const body = !selected ? text : caret != null ? text.slice(0, caret) + selected + text.slice(caret) : text + selected;
   const full = pad + body + tail;
   const at =
     caret == null
@@ -3148,26 +3314,27 @@ function wireEvents() {
     if (name === doc.name) return;
     doc.name = name;
     // Rename in place at the source: Drive files rename via API immediately.
-    if (state.current.driveId) {
+    if (doc.driveId) {
       const finalName = ensureMdName(name);
       try {
-        await google.drive.rename(state.current.driveId, finalName);
-        state.current.name = finalName;
-        state.current.driveName = finalName;
-        docTitle.value = finalName;
+        await google.drive.rename(doc.driveId, finalName);
+        doc.name = finalName;
+        doc.driveName = finalName;
+        // Only touch the visible field if this document is still the open one:
+        // clicking another document fires this handler's blur first, and reading
+        // state.current after the await renamed whichever document had arrived.
+        if (state.current === doc) docTitle.value = finalName;
         // Keep the cached Drive listing in step. It used to keep the old name,
         // so the sidebar showed the stale row — and clicking it reopened the
         // file and wrote the old name back over the rename.
-        const cached = state.driveCache[state.current.driveParentId]?.files?.find(
-          (x) => x.id === state.current.driveId,
-        );
+        const cached = state.driveCache[doc.driveParentId]?.files?.find((x) => x.id === doc.driveId);
         if (cached) cached.name = finalName;
         toast("Renamed on Drive", "success");
       } catch (e) {
         reportDriveError(e, "Could not rename on Drive");
       }
     }
-    persist(state.current, { touch: false });
+    persist(doc, { touch: false });
     updateStorageLoc();
   });
 
