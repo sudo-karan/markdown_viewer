@@ -141,6 +141,10 @@ for local docs, the Drive API for Drive files.
   Drive folder uploads it — a real move, so it becomes reachable from your other
   devices. Dragging the other way (Drive → This browser) makes a **copy** and
   leaves the Drive original alone, so a drag can never destroy your only copy.
+- **Or use "Move to…"** from a file's **⋯** menu, which does exactly the same
+  thing without a drag. Dragging is HTML5 drag-and-drop, which touch screens
+  never fire and keyboards cannot reach — so on a phone this is the way to move
+  a document between folders, and it is also the accessible path on a desktop.
 - **Drag files in from your computer.** Drop `.md` / `.markdown` / `.txt` /
   `.mmd` files onto any folder in the tree, or anywhere in the **Files** view,
   and they're imported into that folder — including a Google Drive folder, which

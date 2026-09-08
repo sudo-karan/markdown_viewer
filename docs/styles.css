@@ -372,12 +372,17 @@ button { font-family: inherit; }
   position: fixed;
   z-index: 55;
   min-width: 158px;
+  /* The "Move to…" picker lists every folder, so this can get long. */
+  max-width: min(320px, calc(100vw - 16px));
+  max-height: 60vh;
+  overflow-y: auto;
   padding: 5px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: var(--shadow);
 }
+.ctx-menu button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ctx-menu button {
   display: block;
   width: 100%;
