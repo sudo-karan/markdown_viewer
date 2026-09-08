@@ -1317,7 +1317,10 @@ func handleUploadFile(state *State) http.HandlerFunc {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 		var req uploadFileRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				// The reader's cap is the envelope size, not the content size the
+				// caller is told about, so log which one actually tripped.
+				slog.Warn("upload rejected: request body over the limit", "limit", maxErr.Limit)
 				http.Error(w, "file too large (max 10MB)", http.StatusRequestEntityTooLarge)
 				return
 			}
