@@ -22,7 +22,13 @@ window.MO_STUDIO_CONFIG = {
   // Leave it empty and the app still works, but only as a signed-out,
   // this-browser-only editor (each person would have to paste their own ID in
   // Settings). See docs/README.md for the 2-minute setup.
-  googleClientId: "",
+  //
+  // What stops someone else using this ID is NOT its secrecy — it is visible in
+  // the URL of Google's own auth request either way — but the "Authorized
+  // JavaScript origins" allowlist on the OAuth client in Google Cloud Console.
+  // Keep that list tight (this deployment: https://sudo-karan.github.io) and
+  // never put the client *secret* here.
+  googleClientId: "379188864113-b5sbsb0cv8r0e7ll5fqsse1ulsbju6o1.apps.googleusercontent.com",
 
   // Name of the root folder this app creates in your Google Drive. It is an
   // ordinary folder in "My Drive" — you can open, move and rename it from the
