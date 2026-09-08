@@ -50,8 +50,22 @@ export function slugify(str) {
  * keeps its original number and `data-source-line` stays truthful.
  */
 function blankFrontMatter(text) {
-  const m = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/.exec(text || "");
+  const m = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(\r?\n|$)/.exec(text || "");
   if (!m) return text || "";
+  // `---` on line 1 is also a perfectly ordinary thematic break — it is what the
+  // toolbar's own horizontal-rule button inserts — so matching the delimiters
+  // alone deleted the top of any document that opened with one. Only blank the
+  // block when its body actually looks like YAML: no blank lines, at least one
+  // `key:`, and every line either a key, a list item, a comment, or an indented
+  // continuation.
+  const body = m[1];
+  const lines = body.split(/\r?\n/);
+  const looksLikeYaml =
+    body.trim() !== "" &&
+    !lines.some((l) => l.trim() === "") &&
+    lines.some((l) => /^\s*[\w.$-]+\s*:/.test(l)) &&
+    lines.every((l) => /^(\s+\S|\s*#|\s*-\s|\s*[\w.$-]+\s*:)/.test(l));
+  if (!looksLikeYaml) return text;
   const newlines = (m[0].match(/\n/g) || []).length;
   return "\n".repeat(newlines) + text.slice(m[0].length);
 }
@@ -206,12 +220,22 @@ function scrubStyle(value) {
   for (const prop of [...styleProbe.style]) {
     const val = styleProbe.style.getPropertyValue(prop).toLowerCase();
     const drop =
+      // Custom properties are stored verbatim and resolved only at use time, so
+      // every check below is blind to what they hold: `--p:fixed` +
+      // `position:var(--p)` produced a full-viewport overlay, and
+      // `--u:\75 rl(https://…)` + `background-image:var(--u)` a working beacon.
+      // Nothing markdown-it, KaTeX or Mermaid emits needs them.
+      prop.startsWith("--") ||
+      // …and neither does anything legitimate need the indirection itself.
+      val.includes("var(") ||
       (prop === "position" && /fixed|absolute|sticky/.test(val)) ||
       prop === "z-index" ||
       /expression\s*\(|behavior|-moz-binding|@import/.test(val) ||
-      // Allow url(#fragment) (SVG gradient/marker refs); block everything that
-      // reaches the network.
-      /url\(\s*["']?\s*(?!#)/.test(val);
+      // Allow url(#fragment) — SVG gradient/marker refs — and block everything
+      // that reaches the network. The lookahead has to tolerate the quotes the
+      // CSSOM adds when it re-serializes, or `url(#g)` comes back as
+      // `url("#g")` and gets dropped along with the rest.
+      /url\(\s*(?!["']?#)/.test(val);
     if (drop) styleProbe.style.removeProperty(prop);
   }
   return styleProbe.style.cssText;
@@ -419,6 +443,28 @@ function fixDiagramContrast(fig) {
   }
 }
 
+/**
+ * Give a diagram its natural size and let the figure scroll.
+ *
+ * Mermaid writes `style="max-width: <layout width>px"` directly on the <svg>,
+ * and an inline style beats any stylesheet — so the CSS that was supposed to
+ * stop wide diagrams being squashed had no effect at all, and a gantt chart in
+ * a split-view pane still rendered at about 4px of text. Replacing the inline
+ * cap with the diagram's intrinsic width from its viewBox lets
+ * `.mermaid-figure { overflow-x: auto }` do its job.
+ */
+function sizeDiagram(fig) {
+  const svg = fig.querySelector("svg");
+  if (!svg) return;
+  const vb = (svg.getAttribute("viewBox") || "").split(/[\s,]+/);
+  const width = Number(vb[2]);
+  svg.style.maxWidth = "none";
+  if (Number.isFinite(width) && width > 0) {
+    svg.setAttribute("width", String(width));
+    svg.style.width = width + "px";
+  }
+}
+
 let mermaidReady = false;
 function initMermaid(dark) {
   mermaid.initialize({
@@ -471,6 +517,7 @@ export async function enhance(container, { dark }) {
         // that colours the diagram; with htmlLabels off there is no foreignObject
         // content left to lose here.
         fig.innerHTML = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
+        sizeDiagram(fig);
         pre.replaceWith(fig);
         fixDiagramContrast(fig); // after insertion, so computed fills resolve
       } catch {
