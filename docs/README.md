@@ -23,7 +23,8 @@ Google Drive sync.
   disk, drag-and-drop, or paste an image to embed it as a data URI.
 - **Google Drive sync** (optional) — sign in with Google and keep documents in
   your own Drive under a single root folder (`markdown_sudo-karan` by default). By design
-  the app can see *nothing else* in your Drive.
+  the app can see *nothing else* in your Drive. Editing a Drive document saves
+  back to Drive automatically, and you stay signed in across reloads.
 - **Export & share** — download `.md` or a self-contained `.html`, copy rendered
   HTML, print to PDF, or copy a link that encodes the whole document in the URL.
 - **Themes** — GitHub light/dark, following your system preference.
@@ -68,6 +69,14 @@ Setting a Client ID does double duty: it enables Drive sync **and** turns
 
 There are no passwords to store: Google is the identity provider, and the app
 never sees a credential.
+
+**Staying signed in.** Google hands browser apps short-lived access tokens (about
+an hour) and no refresh token — that is the design, not a limitation of this app.
+So the account you signed in as is remembered in this browser, the token is kept
+for the tab, and a new one is fetched *silently* when it expires or when you
+reload. You should only see Google's dialog again if you sign out, or if your
+Google session itself ends. If it does, the account button says
+**Reconnect to Google Drive**; your documents stay where they are either way.
 
 A GitHub Pages site can't keep secrets, so Drive access uses Google's standard
 browser OAuth flow. You only need a **Client ID** (which is public and safe to
@@ -158,9 +167,15 @@ they're adopted into your account automatically so nothing appears to vanish.
 
 Because the scope is `drive.file`, the app only ever sees the `markdown_sudo-karan`
 subtree — specifically, the folders and files **it** creates or that you open
-through it. Files you add to that folder manually from the Drive website won't
-appear here (that would require a broader, Google-verified scope, which this app
-intentionally avoids).
+through it. Files and folders you add from the Drive website won't appear here.
+That is a deliberate privacy trade-off: showing them would require the broad,
+Google-verified `drive` scope, which would let this app read your entire Drive.
+
+So that this never looks like a bug, an empty Drive folder says so in place, and
+the Drive row's **⋯** menu offers **Refresh** (re-list the folder — Drive changes
+made elsewhere are not pushed to the app) and **Open in Drive** (see the folder's
+real contents on the Drive website). To bring an outside file in, drag it onto a
+folder in the tree or use **Import…**; from then on the app can see it.
 
 ## Security & privacy
 
@@ -172,7 +187,14 @@ intentionally avoids).
 - **Your data stays yours.** Documents live in your browser's `localStorage` and,
   if you connect Drive, in *your own* Google Drive. Nothing is sent to any
   third-party server operated by this project.
-- Rendered HTML is sanitized with DOMPurify before it touches the page.
+- Rendered HTML is sanitized with DOMPurify before it touches the page. Because a
+  document can arrive from someone else (a share link, a Drive file), the
+  sanitizer also strips form controls, so a document cannot render a fake
+  sign-in form on this site's own origin, and inline CSS is parsed by the browser
+  and filtered — not pattern-matched — so escapes like `position:\66 ixed`
+  cannot slip a full-page overlay or a tracking `url()` past it. Ids the document
+  supplies are namespaced, so its headings can never shadow the app's own
+  elements. The page's CSP additionally sets `form-action 'none'`.
 
 ## How it's built
 

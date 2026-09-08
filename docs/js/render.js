@@ -25,14 +25,35 @@ const hljs = window.hljs;
 // then stripped, leaving correctly-sized but completely empty nodes.
 import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
 
-/** Stable, GitHub-compatible heading slugs (used by the outline + anchor links). */
+/**
+ * Stable, GitHub-compatible heading slugs (used by the outline + anchor links).
+ *
+ * Unicode-aware on purpose: `\w` is ASCII-only, so a `[^\w\- ]` filter deleted
+ * every character of a Japanese, Chinese, Korean or Cyrillic heading, leaving it
+ * with an empty id — which dropped it from the outline entirely and broke any
+ * in-document link to it. GitHub keeps Unicode letters, and so do we.
+ */
 export function slugify(str) {
   return String(str)
+    .normalize("NFKC")
     .trim()
     .toLowerCase()
-    .replace(/[^\w\- ]+/g, "")
+    .replace(/[^\p{L}\p{N}\- ]+/gu, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-");
+}
+
+/**
+ * YAML front matter is metadata, not content. Left alone it renders as a
+ * horizontal rule plus a setext heading built out of the keys, which then leads
+ * the outline. Blank it out rather than deleting it so every following line
+ * keeps its original number and `data-source-line` stays truthful.
+ */
+function blankFrontMatter(text) {
+  const m = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/.exec(text || "");
+  if (!m) return text || "";
+  const newlines = (m[0].match(/\n/g) || []).length;
+  return "\n".repeat(newlines) + text.slice(m[0].length);
 }
 
 const md = new MarkdownIt({
@@ -105,20 +126,40 @@ function stampSourceLines(rules) {
       ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
     md.renderer.rules[rule] = (tokens, idx, options, env, self) => {
       const t = tokens[idx];
-      if (t.level === 0 && t.map) t.attrSet("data-source-line", String(t.map[0]));
+      if (t.map) t.attrSet("data-source-line", String(t.map[0]));
       return prev(tokens, idx, options, env, self);
     };
   }
 }
+// Nested blocks are stamped too (the old `level === 0` restriction meant every
+// bullet of a 40-item list and every row of a table reported the line of the
+// list/table itself, so "click the preview to find the source" always landed on
+// the first line). Document order still gives monotonically increasing lines,
+// which is all the scroll-sync interpolation needs.
 stampSourceLines([
   "paragraph_open",
   "heading_open",
   "blockquote_open",
   "bullet_list_open",
   "ordered_list_open",
+  "list_item_open",
   "table_open",
+  "tr_open",
+  "code_block", // indented code — renders via renderAttrs, so attrSet works
   "hr",
 ]);
+
+// Raw HTML blocks are emitted verbatim from token.content, so the generic
+// stamper can't reach them: without this a document that is mostly raw HTML has
+// no anchors at all and scroll sync silently falls back to a proportional map.
+const defaultHtmlBlock =
+  md.renderer.rules.html_block || ((tokens, idx) => tokens[idx].content);
+md.renderer.rules.html_block = (tokens, idx, options, env, self) => {
+  const out = defaultHtmlBlock(tokens, idx, options, env, self);
+  const t = tokens[idx];
+  if (t.map) return out.replace(/^(\s*<[a-zA-Z][\w-]*)\b/, `$1 data-source-line="${t.map[0]}"`);
+  return out;
+};
 
 // Code fences (including Mermaid) build their own markup via highlight(), so the
 // generic stamper can't reach them. Wrap the fence renderer to inject the source
@@ -148,26 +189,66 @@ const ALERT_TYPES = {
 // while preserving the inline styles KaTeX and Mermaid legitimately emit (which
 // never set `position`/`z-index` or external `url()`). Also force rel=noopener
 // on any target=_blank link, including ones authored as raw HTML.
+// Pattern-matching the raw declaration text is not enough: CSS identifiers
+// accept `\XX ` hex escapes, so `position:\66 ixed` and
+// `background-image:\75 rl(https://…)` sail straight past a text filter and are
+// then resolved by the CSS parser — giving a full-viewport overlay and a working
+// exfiltration beacon respectively. Parse the declaration with the browser's own
+// parser first (which normalises escapes), then inspect the result.
+const styleProbe = document.createElement("span");
 function scrubStyle(value) {
-  return value
-    .split(";")
-    .map((d) => d.trim())
-    .filter(Boolean)
-    .filter((decl) => {
-      const m = decl.match(/^([\w-]+)\s*:\s*([\s\S]*)$/);
-      if (!m) return false;
-      const prop = m[1].toLowerCase();
-      const val = m[2].toLowerCase();
-      if (prop === "position" && /(fixed|absolute|sticky)/.test(val)) return false;
-      if (prop === "z-index") return false;
-      if (/expression\s*\(|behavior\s*:|-moz-binding|@import/.test(val)) return false;
-      // Allow url(#fragment) (SVG gradient refs); block external/scheme url()s.
-      if (/url\s*\(\s*['"]?\s*(?!#)/.test(val)) return false;
-      return true;
-    })
-    .join("; ");
+  styleProbe.style.cssText = "";
+  try {
+    styleProbe.style.cssText = value;
+  } catch {
+    return "";
+  }
+  for (const prop of [...styleProbe.style]) {
+    const val = styleProbe.style.getPropertyValue(prop).toLowerCase();
+    const drop =
+      (prop === "position" && /fixed|absolute|sticky/.test(val)) ||
+      prop === "z-index" ||
+      /expression\s*\(|behavior|-moz-binding|@import/.test(val) ||
+      // Allow url(#fragment) (SVG gradient/marker refs); block everything that
+      // reaches the network.
+      /url\(\s*["']?\s*(?!#)/.test(val);
+    if (drop) styleProbe.style.removeProperty(prop);
+  }
+  return styleProbe.style.cssText;
 }
 
+// Interactive form controls have no place in rendered Markdown, and DOMPurify's
+// default HTML profile allows them. A document arriving through a #s= share link
+// or a Drive file could therefore render a convincing full-page "Sign in with
+// Google" form ON THE APP'S OWN ORIGIN and POST the password anywhere. The one
+// exception is the task-list checkbox, which is stripped down to nothing that
+// can be submitted.
+const FORM_TAGS = [
+  "form", "button", "select", "option", "optgroup", "textarea", "label",
+  "fieldset", "legend", "output", "progress", "meter", "dialog", "datalist",
+];
+const CHECKBOX_ATTRS = ["type", "checked", "disabled", "class", "id"];
+
+// Ids written by the document must not be able to shadow the application's own
+// elements: `document.getElementById("files-view")` would otherwise find a
+// heading in the preview (a plain `## Files view` is enough — its slug collides),
+// and clicking Files would show a blank workspace. GitHub prefixes for exactly
+// this reason. Only applied to Markdown output; the Mermaid SVG pass needs its
+// internal `url(#id)` marker references left intact.
+const ID_PREFIX = "user-content-";
+let namespaceIds = false;
+
+DOMPurify.addHook("uponSanitizeElement", (node, data) => {
+  if (!namespaceIds || data.tagName !== "input") return;
+  const type = (node.getAttribute?.("type") || "").toLowerCase();
+  if (type !== "checkbox") {
+    node.parentNode?.removeChild(node);
+    return;
+  }
+  for (const attr of [...(node.attributes || [])]) {
+    if (!CHECKBOX_ATTRS.includes(attr.name.toLowerCase())) node.removeAttribute(attr.name);
+  }
+});
 DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
   if (data.attrName === "style" && data.attrValue) {
     data.attrValue = scrubStyle(data.attrValue);
@@ -177,6 +258,16 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   if (node.tagName === "A" && node.getAttribute("target") === "_blank") {
     node.setAttribute("rel", "noopener noreferrer");
   }
+  if (!namespaceIds || !node.getAttribute) return;
+  const id = node.getAttribute("id");
+  if (id && !id.startsWith(ID_PREFIX)) node.setAttribute("id", ID_PREFIX + id);
+  if (node.tagName === "A") {
+    const href = node.getAttribute("href") || "";
+    // Keep in-document links working now that their targets are prefixed.
+    if (href.length > 1 && href[0] === "#" && !href.startsWith("#" + ID_PREFIX)) {
+      node.setAttribute("href", "#" + ID_PREFIX + href.slice(1));
+    }
+  }
 });
 
 /**
@@ -185,14 +276,23 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
  * @returns {string}
  */
 export function renderMarkdown(text) {
-  const dirty = md.render(text || "");
-  return DOMPurify.sanitize(dirty, {
-    USE_PROFILES: { html: true, mathMl: true, svg: true, svgFilters: true },
-    ADD_ATTR: ["target", "align", "start", "type", "checked", "disabled", "class", "style", "data-source-line"],
-    ADD_TAGS: ["details", "summary"],
-    FORBID_TAGS: ["style"],
-    ALLOW_DATA_ATTR: false,
-  });
+  const dirty = md.render(blankFrontMatter(text));
+  namespaceIds = true;
+  try {
+    return DOMPurify.sanitize(dirty, {
+      USE_PROFILES: { html: true, mathMl: true, svg: true, svgFilters: true },
+      ADD_ATTR: ["target", "align", "start", "type", "checked", "disabled", "class", "style", "encoding", "data-source-line"],
+      // `semantics`/`annotation` carry KaTeX's original TeX. Dropping them left
+      // the raw source as a loose text node inside <math>, which then leaked
+      // into Export HTML, Copy HTML and any text selection.
+      ADD_TAGS: ["details", "summary", "semantics", "annotation"],
+      FORBID_TAGS: ["style", ...FORM_TAGS],
+      FORBID_ATTR: ["action", "formaction", "form", "method", "enctype", "autofocus", "name"],
+      ALLOW_DATA_ATTR: false,
+    });
+  } finally {
+    namespaceIds = false;
+  }
 }
 
 /** Convert GitHub-style `> [!NOTE]` blockquotes into styled alert callouts. */
@@ -383,8 +483,10 @@ export async function enhance(container, { dark }) {
 /** Extract the heading outline from already-rendered preview DOM. */
 export function extractOutline(container) {
   const items = [];
-  container.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((h) => {
-    if (!h.id) return;
+  container.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((h, i) => {
+    // A heading with no id (raw HTML, or one whose text slugs to nothing) used
+    // to be dropped from the outline entirely. Give it one instead.
+    if (!h.id) h.id = `user-content-heading-${i}`;
     // Ignore the injected anchor "#" text.
     const text = h.textContent.replace(/^#\s*/, "").trim();
     items.push({ id: h.id, level: Number(h.tagName[1]), text });

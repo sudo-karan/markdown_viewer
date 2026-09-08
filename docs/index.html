@@ -7,7 +7,7 @@
          endpoints this app actually uses. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://esm.sh https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; img-src 'self' data: https:; connect-src 'self' https://esm.sh https://cdn.jsdelivr.net https://*.googleapis.com https://accounts.google.com https://oauth2.googleapis.com; frame-src https://accounts.google.com https://content.googleapis.com"
+      content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://esm.sh https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; img-src 'self' data: https:; connect-src 'self' https://esm.sh https://cdn.jsdelivr.net https://*.googleapis.com https://accounts.google.com https://oauth2.googleapis.com; frame-src https://accounts.google.com https://content.googleapis.com"
     />
     <title>Markdown Studio</title>
     <meta
@@ -164,6 +164,7 @@
           <textarea
             id="editor"
             class="editor"
+            aria-label="Markdown source"
             spellcheck="true"
             autocomplete="off"
             autocapitalize="off"
@@ -192,10 +193,10 @@
             <table class="files-table">
               <thead>
                 <tr>
-                  <th data-sort="name" scope="col">Name</th>
-                  <th data-sort="size" scope="col">Size</th>
-                  <th data-sort="created" scope="col">Created</th>
-                  <th data-sort="modified" scope="col">Modified</th>
+                  <th data-sort="name" scope="col" aria-sort="ascending"><button type="button" class="th-sort">Name</button></th>
+                  <th data-sort="size" scope="col"><button type="button" class="th-sort">Size</button></th>
+                  <th data-sort="created" scope="col"><button type="button" class="th-sort">Created</button></th>
+                  <th data-sort="modified" scope="col"><button type="button" class="th-sort">Modified</button></th>
                   <th scope="col"><span class="sr-only">Actions</span></th>
                 </tr>
               </thead>
@@ -306,30 +307,66 @@
       </div>
     </div>
 
-    <div id="toast" class="toast" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
 
     <script>
-      // Watchdog: if the CDN-loaded ES module graph fails (blocked CDN / offline),
-      // show a visible message instead of leaving a blank page. app.js sets
-      // window.__mdsReady once it boots.
-      window.addEventListener("load", function () {
-        setTimeout(function () {
-          if (window.__mdsReady) return;
+      // Boot watchdog. app.js sets window.__mdsReady once it has booted.
+      //
+      // The editor starts DISABLED and the status reads "Loading…": the shell
+      // used to render a writable textarea next to a green "Saved" while the
+      // module graph was dead, so anything typed in the first ten seconds was
+      // silently thrown away.
+      (function () {
+        var ed = document.getElementById("editor");
+        var st = document.getElementById("save-state");
+        if (ed) ed.disabled = true;
+        if (st) st.textContent = "Loading…";
+        var moduleFailed = false;
+        // Distinguish "our own script 404'd" (a bad deploy or a stale ?v=) from
+        // "a CDN is blocked": the old message always blamed the CDN.
+        window.addEventListener(
+          "error",
+          function (e) {
+            var t = e.target;
+            if (t && t.tagName === "SCRIPT" && String(t.src || "").indexOf("/js/app.js") !== -1) {
+              moduleFailed = true;
+            }
+          },
+          true,
+        );
+        function ready() {
+          return window.__mdsReady === true;
+        }
+        function fail() {
+          if (ready()) return;
+          if (ed) {
+            ed.disabled = true;
+            ed.placeholder = "Markdown Studio didn't finish loading.";
+          }
+          if (st) st.textContent = "Not loaded";
+          if (document.getElementById("mds-boot-error")) return;
           var b = document.createElement("div");
+          b.id = "mds-boot-error";
           b.setAttribute("role", "alert");
           b.style.cssText =
             "position:fixed;left:50%;top:20px;transform:translateX(-50%);z-index:999;max-width:90%;" +
             "background:#f85149;color:#fff;padding:12px 18px;border-radius:8px;" +
             "font:14px/1.5 system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.4)";
-          b.textContent =
-            "Markdown Studio couldn't load its libraries (a CDN may be blocked or you're offline). Check your connection and reload.";
+          b.textContent = moduleFailed
+            ? "Markdown Studio couldn't load its own scripts. Reload the page; if it keeps happening the site may be mid-deploy."
+            : "Markdown Studio couldn't load its libraries (a CDN may be blocked, or you're offline). Check your connection and reload.";
           document.body.appendChild(b);
-        }, 10000);
-      });
+        }
+        window.addEventListener("load", function () {
+          setTimeout(function () {
+            if (!ready()) fail();
+          }, 3000);
+        });
+      })();
     </script>
     <!-- ?v= cache-buster: bump on every JS change so GitHub Pages / the browser
          never serve a stale module after a deploy. Keep in sync with the ?v= on
          the imports inside app.js. -->
-    <script type="module" src="./js/app.js?v=20260906"></script>
+    <script type="module" src="./js/app.js?v=20260908"></script>
   </body>
 </html>

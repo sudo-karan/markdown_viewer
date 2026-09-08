@@ -7,9 +7,9 @@
  */
 // ?v= cache-buster: bump on every JS change (keep in sync with index.html's
 // script tag) so a deploy never leaves the browser on a stale module.
-import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260906";
-import { store, upsertDoc, removeDoc, uid, setAccount } from "./storage.js?v=20260906";
-import * as google from "./google.js?v=20260906";
+import { renderMarkdown, enhance, extractOutline, slugify } from "./render.js?v=20260908";
+import { store, upsertDoc, removeDoc, uid, setAccount, getAccount } from "./storage.js?v=20260908";
+import * as google from "./google.js?v=20260908";
 import LZString from "https://esm.sh/lz-string@1.5.0";
 
 const CONFIG = window.MO_STUDIO_CONFIG || {};
@@ -81,6 +81,8 @@ const state = {
   dark: true,
   renderTimer: 0,
   saveTimer: 0,
+  driveSaveTimer: 0,
+  pendingDoc: null, // the doc the debounced autosave is holding, if any
   syncingScroll: false,
   driveRootId: null, // id of the "markdowns" root folder, once loaded
   driveCache: {}, // folderId -> {name,folders:[{id,name}],files:[{id,name,modifiedTime}],loaded,loading,error}
@@ -103,14 +105,20 @@ const googleAvatar = $("google-avatar");
 
 /* ------------------------------------------------------------------ toast */
 let toastTimer = 0;
+let toastHideTimer = 0;
 function toast(msg, kind = "") {
   toastEl.textContent = msg;
   toastEl.className = "toast show " + kind;
   toastEl.hidden = false;
+  // Both timers must be cancelled: the nested one used to survive, so a message
+  // arriving 2.6-2.8s after the previous one was wiped ~200ms later — long
+  // enough to appear, too short to read. "Save failed" landing in that window
+  // simply vanished.
   clearTimeout(toastTimer);
+  clearTimeout(toastHideTimer);
   toastTimer = setTimeout(() => {
     toastEl.classList.remove("show");
-    setTimeout(() => (toastEl.hidden = true), 200);
+    toastHideTimer = setTimeout(() => (toastEl.hidden = true), 200);
   }, 2600);
 }
 
@@ -134,7 +142,13 @@ function applyTheme(dark) {
 }
 
 /* ------------------------------------------------------------------ view mode */
+const isNarrow = () => window.matchMedia?.("(max-width: 720px)")?.matches === true;
+
 function setView(view) {
+  // There is no room for two panes on a phone — the stylesheet hides the editor
+  // in split view — so "Split" stayed highlighted while only the preview showed,
+  // in a mode the user couldn't type into. Call it what it is.
+  if (view === "split" && isNarrow()) view = "preview";
   state.view = view;
   app.setAttribute("data-view", view);
   document.querySelectorAll(".mode-btn").forEach((b) => {
@@ -146,10 +160,19 @@ function setView(view) {
 
 /* ------------------------------------------------------------------ stats + cursor */
 function updateStats() {
-  const text = editor.value;
-  const words = (text.trim().match(/\S+/g) || []).length;
+  // Count prose, not punctuation: every `#`, `-`, `>` and fence line used to be
+  // counted as a word, so a 40-item list over-reported by 40 and skewed the
+  // reading time with it.
+  const prose = editor.value
+    .replace(/^```[\s\S]*?^```/gm, "") // fenced code
+    .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+[.)])\s+/gm, "") // block markers
+    .replace(/^\s*\|.*\|\s*$/gm, (row) => row.replace(/\|/g, " ")) // table pipes
+    .replace(/^\s*[-*_]{3,}\s*$/gm, ""); // thematic breaks
+  const words = (prose.trim().match(/\S+/g) || []).length;
   $("stat-words").textContent = `${words.toLocaleString()} word${words === 1 ? "" : "s"}`;
-  $("stat-read").textContent = `${Math.max(1, Math.ceil(words / 200))} min read`;
+  $("stat-read").textContent = words
+    ? `${Math.max(1, Math.ceil(words / 200))} min read`
+    : "0 min read";
 }
 function updateCursor() {
   const upto = editor.value.slice(0, editor.selectionStart);
@@ -219,21 +242,65 @@ function setSaveState(s) {
 }
 
 function updateStorageLoc() {
-  if (state.current?.driveId) storageLoc.textContent = "Drive: " + state.current.name;
-  else storageLoc.textContent = "Local";
+  const doc = state.current;
+  if (!doc?.driveId) {
+    storageLoc.textContent = "Local";
+    storageLoc.title = "Saved in this browser only";
+    return;
+  }
+  // "Saved" + "Drive: notes.md" used to be shown while the Drive copy was still
+  // the pre-edit one, because autosave was local-only. Now edits are pushed
+  // (see scheduleDriveSync); this reports honestly whenever they haven't landed.
+  const behind = (doc.updated || 0) > (doc.driveSyncedAt || 0);
+  storageLoc.textContent = behind ? `Drive: ${doc.name} · syncing…` : `Drive: ${doc.name}`;
+  storageLoc.title = behind
+    ? "Saved in this browser; the Google Drive copy is being updated"
+    : "In sync with Google Drive";
 }
 
 /* ------------------------------------------------------------------ documents */
-function persist(doc, { markSaved = true, rerender = true } = {}) {
-  doc.updated = Date.now();
+/**
+ * Write a document to this browser's library.
+ *
+ * @param {object} doc
+ * @param {{markSaved?:boolean, rerender?:boolean, touch?:boolean}} opts
+ *   touch — stamp `updated`. False for structural edits (rename, move): they are
+ *   not content changes and should not reorder the Modified column.
+ * @returns {boolean} whether the write actually reached storage.
+ */
+function persist(doc, { markSaved = true, rerender = true, touch = true } = {}) {
+  if (touch) doc.updated = Date.now();
   state.library = upsertDoc(state.library, doc);
-  store.saveLibrary(state.library);
-  store.setCurrentId(doc.id);
-  if (rerender) renderTree();
-  if (markSaved) setSaveState("saved");
+  const ok = store.saveLibrary(state.library);
+  // Only the document on screen owns the "reopen this next time" pointer.
+  // Renaming or moving a background document used to steal it, so the next
+  // reload opened a file the user had not been editing.
+  if (doc.id === state.current?.id) store.setCurrentId(doc.id);
+  if (rerender) refreshViews();
+  // A refused write (private mode, or a full quota — easy to reach, because
+  // pasted images are embedded as base64 data URIs) must never be reported as
+  // "Saved": the document would be gone on the next reload with no warning.
+  if (!ok) {
+    setSaveState("error");
+    toast("Couldn't save to this browser — storage is full or blocked. Download a copy.", "error");
+  } else if (markSaved) {
+    setSaveState("saved");
+  }
+  return ok;
+}
+
+/** Commit a pending debounced autosave immediately. */
+function flushSave() {
+  if (!state.saveTimer) return;
+  clearTimeout(state.saveTimer);
+  state.saveTimer = 0;
+  if (state.pendingDoc) persist(state.pendingDoc, { rerender: false });
+  state.pendingDoc = null;
 }
 
 function loadDoc(doc) {
+  // Switching documents must not strand the previous one's unsaved keystrokes.
+  flushSave();
   state.current = doc;
   editor.value = doc.text || "";
   docTitle.value = doc.name || "Untitled.md";
@@ -242,7 +309,7 @@ function loadDoc(doc) {
   updateStats();
   updateCursor();
   renderNow();
-  renderTree();
+  refreshViews();
   setSaveState("saved");
   editor.scrollTop = 0;
 }
@@ -347,6 +414,11 @@ function openContextMenu(x, y, items) {
   setTimeout(() => document.addEventListener("click", onCtxOutside, true), 0);
 }
 
+function clearDropHighlights() {
+  document.querySelectorAll(".drop-target").forEach((el) => el.classList.remove("drop-target"));
+  $("files-view")?.classList.remove("drop-active");
+}
+
 /* ---- one tree row ---- */
 function makeRow(o) {
   const row = document.createElement("div");
@@ -408,6 +480,10 @@ function makeRow(o) {
       e.dataTransfer.setData("text/plain", JSON.stringify(o.dragData));
       e.dataTransfer.effectAllowed = "move";
     });
+    // A drag cancelled with Esc, or dropped on nothing, fires dragend but never
+    // dragleave/drop — the highlight used to stay stuck on the last folder
+    // hovered until something unrelated re-rendered the tree.
+    row.addEventListener("dragend", clearDropHighlights);
   }
   // Folder rows accept both an in-app drag (a row, possibly from the *other*
   // source) and files dragged in from the computer.
@@ -471,6 +547,20 @@ function buildLocalTree() {
   return root;
 }
 
+/**
+ * Redraw everything that lists documents.
+ *
+ * The sidebar tree stays visible and interactive while the full-width Files view
+ * is open, so any mutation has to reach both. Redrawing only the tree left the
+ * table showing rows for documents that no longer existed — and clicking such a
+ * row reopened the deleted document and the next keystroke wrote it back.
+ * `renderFiles()` no-ops when the view is closed, so this is safe everywhere.
+ */
+function refreshViews() {
+  renderTree();
+  renderFiles();
+}
+
 /* ---- render ---- */
 function renderTree() {
   closeContextMenu(); // an open menu's anchor row is about to be removed
@@ -502,18 +592,28 @@ function renderTree() {
     onToggle: toggleDriveRoot,
     // Always droppable: the root folder is resolved (and created) on drop.
     dropTarget: { source: "drive", folderId: state.driveRootId },
-    menu: state.driveRootId
-      ? () => [
-          ["New file", () => newFileDrive(state.driveRootId)],
-          ["New folder", () => newFolderDrive(state.driveRootId)],
-        ]
-      : undefined,
+    menu: state.driveRootId ? () => driveFolderMenu(state.driveRootId, null) : undefined,
   });
   if (isExpanded(DRIVE_ROOT_KEY)) {
     if (!google.isConfigured()) appendHint("Add a Google Client ID in Settings to use Drive.", 1);
     else if (state.driveRootId) renderDriveChildren(state.driveRootId, 1);
     else appendHint("Loading…", 1);
   }
+}
+
+/** Actions shared by the Drive root row and every Drive subfolder row. */
+function driveFolderMenu(folderId, parentId, folder) {
+  const items = [
+    ["New file", () => newFileDrive(folderId)],
+    ["New folder", () => newFolderDrive(folderId)],
+    ["Refresh", () => loadDriveFolder(folderId, { force: true })],
+    ["Open in Drive", () => window.open(google.drive.folderUrl(folderId), "_blank", "noopener")],
+  ];
+  if (folder) {
+    items.push(["Rename", () => renameDriveFolder(folder)]);
+    items.push(["Delete", () => deleteDriveFolder(folder, parentId), "danger"]);
+  }
+  return items;
 }
 
 function renderLocalFolder(node, depth) {
@@ -577,12 +677,7 @@ function renderDriveChildren(folderId, depth) {
       name: f.name,
       onToggle: () => toggleDriveFolder(f.id, key),
       dropTarget: { source: "drive", folderId: f.id },
-      menu: () => [
-        ["New file", () => newFileDrive(f.id)],
-        ["New folder", () => newFolderDrive(f.id)],
-        ["Rename", () => renameDriveFolder(f)],
-        ["Delete", () => deleteDriveFolder(f, folderId), "danger"],
-      ],
+      menu: () => driveFolderMenu(f.id, folderId, f),
     });
     if (isExpanded(key)) renderDriveChildren(f.id, depth + 1);
   }
@@ -603,7 +698,14 @@ function renderDriveChildren(folderId, depth) {
       ],
     });
   }
-  if (c.loaded && folders.length === 0 && files.length === 0) appendHint("Empty", depth);
+  if (c.loaded && folders.length === 0 && files.length === 0) {
+    // A bare "Empty" is actively misleading here: with the least-privilege
+    // drive.file scope the app can only see what it created itself, so a folder
+    // the user filled from the Drive website looks empty and the app looks
+    // broken. Say why, and offer the way to check.
+    appendHint("Empty — this app only sees files it created here.", depth);
+    appendHint("Files added on drive.google.com won't show up; import or drag them in.", depth);
+  }
 }
 
 /* ---- lazy Drive loading ---- */
@@ -613,10 +715,7 @@ async function ensureDriveReady() {
     openModal("settings-modal");
     return false;
   }
-  if (!google.isSignedIn() || !google.getAccountId()) {
-    await google.signIn();
-    await onSignedIn(); // signing in here also switches accounts
-  }
+  await ensureSignedIn();
   refreshGoogleUI();
   if (!state.driveRootId) {
     const root = await google.drive.root();
@@ -630,13 +729,14 @@ async function ensureDriveReady() {
   }
   return true;
 }
-async function loadDriveFolder(folderId) {
+async function loadDriveFolder(folderId, { force = false } = {}) {
+  if (!folderId) return;
   const c = (state.driveCache[folderId] = state.driveCache[folderId] || {
     folders: [],
     files: [],
     loaded: false,
   });
-  if (c.loaded && !c.error) return;
+  if (c.loaded && !c.error && !force) return;
   c.loading = true;
   renderTree();
   try {
@@ -647,9 +747,10 @@ async function loadDriveFolder(folderId) {
     c.error = null;
   } catch (e) {
     c.error = e.message || "Could not list this folder.";
+    c.loaded = true; // stop rendering a "Loading…" hint that will never resolve
   } finally {
     c.loading = false;
-    renderTree();
+    refreshViews();
   }
 }
 async function toggleDriveRoot() {
@@ -680,24 +781,38 @@ function newFileLocal(folderPath) {
   if (folderPath) setExpanded("L:" + folderPath, true);
   newDoc("Untitled.md", "", folderPath);
 }
+/**
+ * Folder names can't contain "/" (it is the path separator), so slashes become
+ * hyphens — but that has to happen BEFORE the emptiness check, or a name of
+ * "///" turns into a folder literally called "---".
+ */
+function cleanFolderName(raw) {
+  return String(raw ?? "").replace(/\//g, "-").replace(/^[-\s]+|[-\s]+$/g, "");
+}
 function newFolderLocal(parentPath) {
-  const name = (prompt("New folder name:") || "").trim().replace(/\//g, "-");
+  const name = cleanFolderName(prompt("New folder name:"));
   if (!name) return;
   const path = parentPath ? parentPath + "/" + name : name;
   const lf = localFolders();
-  if (!lf.includes(path)) lf.push(path);
-  store.saveSettings(state.settings);
+  if (lf.includes(path)) {
+    toast(`A folder named “${name}” already exists here`, "error");
+  } else {
+    lf.push(path);
+    store.saveSettings(state.settings);
+  }
   setExpanded(LOCAL_ROOT_KEY, true);
   if (parentPath) setExpanded("L:" + parentPath, true);
   setExpanded("L:" + path, true);
-  renderTree();
+  refreshViews();
 }
 function renameLocalDoc(doc) {
   const name = (prompt("Rename document:", doc.name) || "").trim();
   if (!name || name === doc.name) return;
   doc.name = name;
   if (doc.id === state.current?.id) docTitle.value = name;
-  persist(doc);
+  // touch:false — a rename is not a content edit and shouldn't reorder the
+  // Modified column.
+  persist(doc, { touch: false });
 }
 function renamePrefix(p, oldP, newP) {
   if (p === oldP) return newP;
@@ -707,10 +822,19 @@ function renamePrefix(p, oldP, newP) {
 function renameLocalFolder(path) {
   const segs = path.split("/");
   const cur = segs[segs.length - 1];
-  const name = (prompt("Rename folder:", cur) || "").trim().replace(/\//g, "-");
+  const name = cleanFolderName(prompt("Rename folder:", cur));
   if (!name || name === cur) return;
   const newPath = segs.slice(0, -1).concat(name).join("/");
-  state.settings.localFolders = localFolders().map((p) => renamePrefix(p, path, newPath));
+  // Renaming onto an existing sibling merges the two folders. That may be what
+  // the user wants, but it used to happen silently.
+  if (localFolders().includes(newPath)) {
+    if (!confirm(`A folder named “${name}” already exists here. Merge them?`)) return;
+  }
+  // Dedupe: the merge above used to leave the same path in the list twice, and
+  // each later rename doubled it again.
+  state.settings.localFolders = [
+    ...new Set(localFolders().map((p) => renamePrefix(p, path, newPath))),
+  ];
   for (const d of state.library) {
     if (!d.driveId && d.folder) d.folder = renamePrefix(d.folder, path, newPath);
   }
@@ -723,7 +847,7 @@ function renameLocalFolder(path) {
   }
   store.saveLibrary(state.library);
   store.saveSettings(state.settings);
-  renderTree();
+  refreshViews();
   toast("Folder renamed");
 }
 function deleteLocalFolder(path) {
@@ -734,6 +858,12 @@ function deleteLocalFolder(path) {
   const ids = new Set(docs.map((d) => d.id));
   state.library = state.library.filter((d) => !ids.has(d.id));
   state.settings.localFolders = localFolders().filter((p) => p !== path && !p.startsWith(path + "/"));
+  // Drop the folder's expand state too. Leaving it behind grew the settings blob
+  // without bound and silently pre-expanded any later folder of the same name.
+  const em = expandedMap();
+  for (const k of Object.keys(em)) {
+    if (k === "L:" + path || k.startsWith("L:" + path + "/")) delete em[k];
+  }
   store.saveLibrary(state.library);
   store.saveSettings(state.settings);
   if (state.current && ids.has(state.current.id)) {
@@ -741,7 +871,7 @@ function deleteLocalFolder(path) {
     if (next) loadDoc(next);
     else newDoc();
   } else {
-    renderTree();
+    refreshViews();
   }
   toast("Folder deleted");
 }
@@ -751,7 +881,7 @@ function moveLocal(dragData, targetPath) {
   if (!doc || (doc.folder || "") === targetPath) return;
   doc.folder = targetPath;
   if (targetPath) setExpanded("L:" + targetPath, true);
-  persist(doc);
+  persist(doc, { touch: false }); // a move is not a content edit
   toast("Moved");
 }
 
@@ -763,11 +893,21 @@ function moveLocal(dragData, targetPath) {
  * so a drag can never destroy the only copy of something.
  */
 
-/** Resolve a Drive drop target, falling back to the app's root folder. */
+/**
+ * Resolve a Drive drop target, falling back to the app's root folder.
+ *
+ * This MUST go through ensureDriveReady rather than calling google.drive.root()
+ * directly. The old shortcut returned the folder id without ever assigning
+ * `state.driveRootId` or seeding its cache entry, so a drop onto a Drive row
+ * that had not been expanded yet — the state after every page load, since init()
+ * clears the Drive expand keys — uploaded the file correctly but then left the
+ * tree stuck on a "Loading…" hint with no loader behind it, and the document
+ * gone from "This browser". That is the "dragging to Drive doesn't work" bug.
+ */
 async function resolveDriveFolder(folderId) {
   if (folderId) return folderId;
-  if (state.driveRootId) return state.driveRootId;
-  return (await google.drive.root()).id;
+  if (!state.driveRootId) await ensureDriveReady();
+  return state.driveRootId;
 }
 
 /** Remember a newly created Drive file in the cache so the UI shows it at once. */
@@ -809,25 +949,71 @@ async function moveLocalDocToDrive(dragData, targetFolderId) {
     doc.driveName = res.name || doc.name;
     doc.driveParentId = (res.parents && res.parents[0]) || parent;
     doc.folder = ""; // it lives in Drive now, not in a local virtual folder
+    doc.driveSyncedAt = Date.now();
     cacheDriveFile(parent, res);
-    setExpanded(DRIVE_ROOT_KEY, true);
-    if (parent !== state.driveRootId) setExpanded("D:" + parent, true);
+    revealDriveFolder(parent);
     persist(doc);
     updateStorageLoc();
     setSaveState("saved");
     toast(`Moved “${doc.name}” to Drive`, "success");
   } catch (e) {
     setSaveState("error");
-    toast(e.message || "Could not move that file to Drive", "error");
+    reportDriveError(e, "Could not move that file to Drive");
   }
+}
+
+/**
+ * Open the Drive tree down to `folderId` and make sure its contents are on
+ * screen. Without the explicit load, a file uploaded into a folder that had
+ * never been expanded landed in an empty cache entry and simply wasn't shown.
+ */
+function revealDriveFolder(folderId) {
+  setExpanded(DRIVE_ROOT_KEY, true);
+  // Guard against `null`: comparing an unresolved root id used to write a bogus
+  // `D:<rootId>` expand key for the root folder itself.
+  if (folderId && state.driveRootId && folderId !== state.driveRootId) {
+    setExpanded("D:" + folderId, true);
+  }
+  refreshViews();
+  loadDriveFolder(folderId, { force: true });
+}
+
+/**
+ * Surface a Drive failure. An expired Google session is not an error the user
+ * can act on from a toast alone, so say what to click.
+ */
+function reportDriveError(e, fallback) {
+  if (e?.signInRequired) {
+    toast(e.message, "error");
+    refreshGoogleUI();
+    return;
+  }
+  toast(e?.message || fallback, "error");
+}
+
+/** "notes.md" → "notes (2).md" when that folder already holds a "notes.md". */
+function uniqueLocalName(name, folder) {
+  const taken = new Set(
+    state.library.filter((d) => !d.driveId && (d.folder || "") === folder).map((d) => d.name),
+  );
+  if (!taken.has(name)) return name;
+  const dot = name.lastIndexOf(".");
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let i = 2; i < 1000; i++) {
+    const candidate = `${base} (${i})${ext}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return name;
 }
 
 /** Copy a Drive file into this browser. The Drive original is left alone. */
 async function copyDriveFileToLocal(dragData, targetPath) {
   try {
     const text = await google.drive.read(dragData.id);
-    const name = dragData.name || "Untitled.md";
     const now = Date.now();
+    // Repeat drags used to pile up indistinguishable rows with the same name.
+    const name = uniqueLocalName(dragData.name || "Untitled.md", targetPath || "");
     const doc = {
       id: uid(), name, text, driveId: null,
       folder: targetPath || "", created: now, updated: now,
@@ -836,11 +1022,10 @@ async function copyDriveFileToLocal(dragData, targetPath) {
     store.saveLibrary(state.library);
     setExpanded(LOCAL_ROOT_KEY, true);
     if (targetPath) setExpanded("L:" + targetPath, true);
-    renderTree();
-    renderFiles();
+    refreshViews();
     toast(`Copied “${name}” into this browser`, "success");
   } catch (e) {
-    toast(e.message || "Could not copy that file from Drive", "error");
+    reportDriveError(e, "Could not copy that file from Drive");
   }
 }
 
@@ -870,8 +1055,11 @@ const IMPORTABLE = /\.(md|markdown|txt|mmd)$/i;
  * browser's local library.
  * @param {FileList|File[]} fileList
  * @param {{source:"local",path?:string}|{source:"drive",folderId?:string}} target
+ * @param {{openSingle?:boolean}} opts — openSingle switches the editor to a
+ *   lone imported file. True only for a drop on the editor, where retargeting is
+ *   the point; from the Files view it silently swapped the open document.
  */
-async function importFilesInto(fileList, target) {
+async function importFilesInto(fileList, target, { openSingle = false } = {}) {
   const all = [...(fileList || [])];
   const files = all.filter((f) => IMPORTABLE.test(f.name));
   const skipped = all.length - files.length;
@@ -880,6 +1068,8 @@ async function importFilesInto(fileList, target) {
     return;
   }
   let ok = 0;
+  let failed = 0;
+  let firstError = "";
   let lastLocalDoc = null;
   try {
     if (target?.source === "drive") {
@@ -890,12 +1080,15 @@ async function importFilesInto(fileList, target) {
           const res = await google.drive.create(ensureMdName(f.name), await f.text(), parent);
           cacheDriveFile(parent, res);
           ok++;
-        } catch {
-          /* keep importing the rest; the count reports the truth */
+        } catch (e) {
+          // Keep importing the rest, but remember what went wrong: reporting
+          // "Imported 2 files" in green when a third was rejected for quota
+          // told the user their file had arrived when it hadn't.
+          failed++;
+          if (!firstError) firstError = e?.message || "";
         }
       }
-      setExpanded(DRIVE_ROOT_KEY, true);
-      if (parent !== state.driveRootId) setExpanded("D:" + parent, true);
+      revealDriveFolder(parent);
     } else {
       const folder = target?.path || "";
       for (const f of files) {
@@ -912,18 +1105,16 @@ async function importFilesInto(fileList, target) {
       if (folder) setExpanded("L:" + folder, true);
     }
   } catch (e) {
-    toast(e.message || "Import failed", "error");
+    reportDriveError(e, "Import failed");
     return;
   }
-  renderTree();
-  renderFiles();
-  // Opening a single imported local file matches what the editor drop used to do.
-  if (ok === 1 && lastLocalDoc) loadDoc(lastLocalDoc);
+  refreshViews();
+  if (openSingle && ok === 1 && lastLocalDoc) loadDoc(lastLocalDoc);
   const where = target?.source === "drive" ? "Drive" : "this browser";
-  toast(
-    `Imported ${ok} file${ok === 1 ? "" : "s"} into ${where}` + (skipped ? ` · skipped ${skipped}` : ""),
-    ok ? "success" : "error",
-  );
+  const parts = [`Imported ${ok} of ${all.length} into ${where}`];
+  if (skipped) parts.push(`skipped ${skipped} unsupported`);
+  if (failed) parts.push(`${failed} failed${firstError ? ": " + firstError : ""}`);
+  toast(parts.join(" · "), failed || !ok ? "error" : "success");
 }
 
 /* ---- Drive operations ---- */
@@ -949,7 +1140,7 @@ async function newFileDrive(parentId) {
     loadDoc(doc);
     toast("Created in Drive", "success");
   } catch (e) {
-    toast(e.message || "Could not create file", "error");
+    reportDriveError(e, "Could not create file");
   }
 }
 async function newFolderDrive(parentId) {
@@ -958,16 +1149,19 @@ async function newFolderDrive(parentId) {
   try {
     const res = await google.drive.createFolder(name, parentId);
     const c = state.driveCache[parentId];
-    if (c && c.loaded) c.folders.push({ id: res.id, name: res.name });
+    if (c && c.loaded) c.folders.push(res);
     state.driveCache[res.id] = { name: res.name, folders: [], files: [], loaded: true };
-    renderTree();
+    refreshViews();
     toast("Folder created", "success");
   } catch (e) {
-    toast(e.message || "Could not create folder", "error");
+    reportDriveError(e, "Could not create folder");
   }
 }
 async function renameDriveFile(f, parentId) {
-  const name = ensureMdName((prompt("Rename file:", f.name) || "").trim());
+  // Check for a cancelled/blank prompt BEFORE normalising — see ensureMdName.
+  const raw = prompt("Rename file:", f.name);
+  if (raw === null) return;
+  const name = ensureMdName(raw);
   if (!name || name === f.name) return;
   try {
     await google.drive.rename(f.id, name);
@@ -980,10 +1174,10 @@ async function renameDriveFile(f, parentId) {
       store.saveLibrary(state.library);
     }
     void parentId;
-    renderTree();
+    refreshViews();
     toast("Renamed", "success");
   } catch (e) {
-    toast(e.message || "Could not rename", "error");
+    reportDriveError(e, "Could not rename");
   }
 }
 async function renameDriveFolder(f) {
@@ -993,10 +1187,10 @@ async function renameDriveFolder(f) {
     await google.drive.rename(f.id, name);
     f.name = name;
     if (state.driveCache[f.id]) state.driveCache[f.id].name = name;
-    renderTree();
+    refreshViews();
     toast("Renamed", "success");
   } catch (e) {
-    toast(e.message || "Could not rename", "error");
+    reportDriveError(e, "Could not rename");
   }
 }
 async function deleteDriveFile(f, parentId) {
@@ -1017,23 +1211,57 @@ async function deleteDriveFile(f, parentId) {
         return;
       }
     }
-    renderTree();
+    refreshViews();
     toast("Moved to Drive trash");
   } catch (e) {
-    toast(e.message || "Could not delete", "error");
+    reportDriveError(e, "Could not delete");
   }
 }
+/** Every Drive folder id cached beneath (and including) `rootId`. */
+function cachedDriveSubtree(rootId) {
+  const ids = [];
+  const walk = (id) => {
+    if (!id || ids.includes(id)) return;
+    ids.push(id);
+    for (const sub of state.driveCache[id]?.folders || []) walk(sub.id);
+  };
+  walk(rootId);
+  return ids;
+}
+
 async function deleteDriveFolder(f, parentId) {
   if (!confirm(`Move folder "${f.name}" and its contents to the Google Drive trash?`)) return;
   try {
     await google.drive.trash(f.id);
     const c = state.driveCache[parentId];
     if (c) c.folders = c.folders.filter((x) => x.id !== f.id);
-    delete state.driveCache[f.id];
-    renderTree();
-    toast("Moved to Drive trash");
+    // Documents that lived inside used to stay in the library — invisible in
+    // both views (they have a driveId, so the local tree skips them, and their
+    // Drive folder is gone), still open, still labelled "Drive: …", with Ctrl+S
+    // writing into a trashed file. Keep them, as browser-only copies.
+    const subtree = cachedDriveSubtree(f.id);
+    const fileIds = new Set(subtree.flatMap((id) => (state.driveCache[id]?.files || []).map((x) => x.id)));
+    let rescued = 0;
+    for (const doc of state.library) {
+      if (doc.driveId && fileIds.has(doc.driveId)) {
+        doc.driveId = null;
+        doc.driveName = null;
+        doc.driveParentId = null;
+        doc.folder = "";
+        rescued++;
+      }
+    }
+    if (rescued) store.saveLibrary(state.library);
+    for (const id of subtree) delete state.driveCache[id];
+    if (state.current?.driveId === null) updateStorageLoc();
+    refreshViews();
+    toast(
+      rescued
+        ? `Moved to Drive trash · kept ${rescued} document${rescued === 1 ? "" : "s"} in this browser`
+        : "Moved to Drive trash",
+    );
   } catch (e) {
-    toast(e.message || "Could not delete", "error");
+    reportDriveError(e, "Could not delete");
   }
 }
 async function moveDrive(dragData, targetId) {
@@ -1053,10 +1281,10 @@ async function moveDrive(dragData, targetId) {
       doc.driveParentId = targetId;
       store.saveLibrary(state.library);
     }
-    renderTree();
+    refreshViews();
     toast("Moved");
   } catch (e) {
-    toast(e.message || "Could not move", "error");
+    reportDriveError(e, "Could not move");
   }
 }
 
@@ -1069,7 +1297,7 @@ function deleteDoc(doc) {
     if (next) loadDoc(next);
     else newDoc();
   } else {
-    renderTree();
+    refreshViews();
   }
   toast("Document deleted");
 }
@@ -1143,8 +1371,8 @@ async function collectFileRows() {
         size: agg.bytes, created: agg.created, modified: agg.modified,
         nav: { name: sub.name, source: "local", path: sub.path },
         menu: () => [
-          ["Rename", () => { renameLocalFolder(sub.path); renderFiles(); }],
-          ["Delete", () => { deleteLocalFolder(sub.path); renderFiles(); }, "danger"],
+          ["Rename", () => renameLocalFolder(sub.path)],
+          ["Delete", () => deleteLocalFolder(sub.path), "danger"],
         ],
       });
     }
@@ -1152,10 +1380,22 @@ async function collectFileRows() {
       rows.push({
         kind: "file", name: doc.name, icon: FILE_ICON, source: "local",
         size: docBytes(doc.text), created: doc.created, modified: doc.updated,
-        open: () => { loadDoc(doc); closeFiles(); },
+        // Re-resolve by id: a row captured before a delete would otherwise open
+        // a detached object, and the next keystroke wrote it back into the
+        // library — resurrecting the document the user had just removed.
+        open: () => {
+          const live = state.library.find((d) => d.id === doc.id);
+          if (!live) {
+            toast("That document was deleted", "error");
+            refreshViews();
+            return;
+          }
+          loadDoc(live);
+          closeFiles();
+        },
         menu: () => [
-          ["Rename", () => { renameLocalDoc(doc); renderFiles(); }],
-          ["Delete", () => { deleteDoc(doc); renderFiles(); }, "danger"],
+          ["Rename", () => renameLocalDoc(doc)],
+          ["Delete", () => deleteDoc(doc), "danger"],
         ],
       });
     }
@@ -1179,10 +1419,7 @@ async function collectFileRows() {
       kind: "folder", name: f.name, icon: FOLDER_ICON, source: "drive",
       created: f.createdTime, modified: f.modifiedTime,
       nav: { name: f.name, source: "drive", folderId: f.id },
-      menu: () => [
-        ["Rename", async () => { await renameDriveFolder(f); renderFiles(); }],
-        ["Delete", async () => { await deleteDriveFolder(f, folderId); renderFiles(); }, "danger"],
-      ],
+      menu: () => driveFolderMenu(f.id, folderId, f),
     });
   }
   for (const f of c.files) {
@@ -1192,8 +1429,8 @@ async function collectFileRows() {
       created: f.createdTime, modified: f.modifiedTime,
       open: async () => { await openDriveFile(f, folderId); closeFiles(); },
       menu: () => [
-        ["Rename", async () => { await renameDriveFile(f, folderId); renderFiles(); }],
-        ["Delete", async () => { await deleteDriveFile(f, folderId); renderFiles(); }, "danger"],
+        ["Rename", () => renameDriveFile(f, folderId)],
+        ["Delete", () => deleteDriveFile(f, folderId), "danger"],
       ],
     });
   }
@@ -1241,8 +1478,37 @@ function renderFilesCrumbs() {
   });
 }
 
+/**
+ * Drop trailing breadcrumb entries whose folder no longer exists, so deleting or
+ * renaming the folder you are standing in takes you to the nearest surviving
+ * ancestor instead of leaving you inside a phantom that reports "empty".
+ * @returns {boolean} whether anything was pruned
+ */
+function pruneFilesTrail() {
+  const before = filesState.trail.length;
+  while (filesState.trail.length) {
+    const here = filesState.trail[filesState.trail.length - 1];
+    const gone =
+      here.source === "local"
+        ? here.path && !localNodeAt(here.path)
+        : here.folderId && !state.driveCache[here.folderId];
+    if (!gone) break;
+    filesState.trail.pop();
+  }
+  return filesState.trail.length !== before;
+}
+
+// A render started for one folder must not paint over a newer one. Any await in
+// collectFileRows (a Drive listing can take seconds) opens a window in which the
+// user clicks a crumb or another row; the slower request used to win and left
+// the breadcrumb and the table describing different places.
+let filesRenderSeq = 0;
+let filesFocusFirstRow = false;
+
 async function renderFiles() {
   if (!app.classList.contains("files-open")) return;
+  const seq = ++filesRenderSeq;
+  const pruned = pruneFilesTrail();
   renderFilesCrumbs();
   const body = $("files-rows");
   body.innerHTML = `<tr><td colspan="5" class="files-empty">Loading…</td></tr>`;
@@ -1250,6 +1516,7 @@ async function renderFiles() {
   try {
     rows = await collectFileRows();
   } catch (e) {
+    if (seq !== filesRenderSeq) return;
     body.innerHTML = "";
     const tr = document.createElement("tr");
     tr.innerHTML = `<td colspan="5" class="files-empty"></td>`;
@@ -1257,10 +1524,14 @@ async function renderFiles() {
     body.appendChild(tr);
     return;
   }
+  if (seq !== filesRenderSeq) return; // superseded by a later navigation
+  if (pruned) toast("That folder is gone — showing the folder above it");
   body.innerHTML = "";
   document.querySelectorAll(".files-table th[data-sort]").forEach((th) => {
-    th.classList.toggle("sorted", th.dataset.sort === filesState.sort);
-    th.dataset.dir = th.dataset.sort === filesState.sort ? (filesState.dir > 0 ? "asc" : "desc") : "";
+    const active = th.dataset.sort === filesState.sort;
+    th.classList.toggle("sorted", active);
+    th.dataset.dir = active ? (filesState.dir > 0 ? "asc" : "desc") : "";
+    th.setAttribute("aria-sort", active ? (filesState.dir > 0 ? "ascending" : "descending") : "none");
   });
   if (!rows.length) {
     body.innerHTML = `<tr><td colspan="5" class="files-empty">This folder is empty.</td></tr>`;
@@ -1326,6 +1597,10 @@ async function renderFiles() {
       const go = () => {
         if (r.nav) {
           filesState.trail = [...filesState.trail, r.nav];
+          // Keep the keyboard in the table. The tbody is rebuilt from scratch,
+          // which dropped focus onto <body> — so a keyboard user had to Tab past
+          // the toolbar again for every level of nesting.
+          filesFocusFirstRow = document.activeElement?.closest?.(".files-row") != null;
           renderFiles();
         } else r.open();
       };
@@ -1342,6 +1617,10 @@ async function renderFiles() {
     }
     body.appendChild(tr);
   }
+  if (filesFocusFirstRow) {
+    filesFocusFirstRow = false;
+    body.querySelector(".files-row[tabindex]")?.focus();
+  }
 }
 
 function openFiles() {
@@ -1350,6 +1629,9 @@ function openFiles() {
   renderFiles();
 }
 function closeFiles() {
+  // A row menu belongs to the view that opened it: leaving it behind put a live
+  // menu over the editor whose Rename item still worked.
+  closeContextMenu();
   app.classList.remove("files-open");
   $("files-view").hidden = true;
 }
@@ -1401,15 +1683,61 @@ function onEdit() {
   invalidateLineOffsets(); // wrapped-line layout changed
   setSaveState("dirty");
   updateStats();
+  updateCursor();
   scheduleRender();
   clearTimeout(state.saveTimer);
   // Autosave content without rebuilding the tree (name/structure unchanged).
-  state.saveTimer = setTimeout(() => persist(state.current, { rerender: false }), 500);
+  // The document is captured now, not read at fire time: switching files inside
+  // the debounce window used to stamp the *new* document as modified and leave
+  // the edited one behind.
+  const doc = state.current;
+  state.pendingDoc = doc;
+  state.saveTimer = setTimeout(() => {
+    state.saveTimer = 0;
+    state.pendingDoc = null;
+    persist(doc, { rerender: false });
+  }, 500);
+  scheduleDriveSync(doc);
+  updateStorageLoc();
+}
+
+/**
+ * Push a Drive-backed document's edits back to Drive.
+ *
+ * Autosave used to write only to localStorage while the status bar said
+ * "Saved · Drive: notes.md" — so a user editing a Drive document on one machine
+ * found none of it on another. Debounced well past the local save so a burst of
+ * typing is one upload, and silent about an expired session (the status bar
+ * already shows the document is behind).
+ */
+function scheduleDriveSync(doc) {
+  if (!doc?.driveId || !google.isConfigured() || !google.hasSession()) return;
+  clearTimeout(state.driveSaveTimer);
+  state.driveSaveTimer = setTimeout(async () => {
+    state.driveSaveTimer = 0;
+    try {
+      await google.drive.update(doc.driveId, doc.text || "");
+      doc.driveSyncedAt = Date.now();
+      // touch:false — this is the same content, not a new edit.
+      persist(doc, { markSaved: false, rerender: false, touch: false });
+      if (doc.id === state.current?.id) updateStorageLoc();
+    } catch (e) {
+      if (doc.id === state.current?.id) {
+        storageLoc.textContent = `Drive: ${doc.name} · not synced`;
+        storageLoc.title = e?.message || "The Google Drive copy could not be updated";
+      }
+    }
+  }, 2500);
 }
 
 /* ------------------------------------------------------------------ Google Drive */
 function ensureMdName(name) {
-  return /\.(md|markdown|txt|mmd)$/i.test(name) ? name : name.replace(/\s+$/, "") + ".md";
+  const trimmed = String(name || "").trim();
+  // Never invent a name from nothing: ensureMdName("") used to return ".md",
+  // which is truthy, so a cancelled rename sailed past its `if (!name) return`
+  // guard and renamed the user's Drive file to a hidden dotfile.
+  if (!trimmed) return "";
+  return /\.(md|markdown|txt|mmd)$/i.test(trimmed) ? trimmed : trimmed + ".md";
 }
 
 // Save the current doc to Drive. targetFolderId (optional) places a NEW file in,
@@ -1423,7 +1751,11 @@ async function saveToDrive(targetFolderId) {
   }
   setSaveState("saving");
   try {
-    if (!google.isSignedIn()) await google.signIn();
+    // Must go through ensureSignedIn, not google.signIn: signing in here without
+    // switching the storage namespace left every document in the shared
+    // signed-out bucket while the header showed an account — and the next person
+    // to sign in on this browser inherited them, Drive ids and all.
+    await ensureSignedIn();
     const name = ensureMdName(state.current.name);
     if (state.current.driveId) {
       // update() only writes content; title/location changes go separately.
@@ -1446,13 +1778,14 @@ async function saveToDrive(targetFolderId) {
       state.current.driveName = res.name || name;
       docTitle.value = state.current.name;
     }
+    state.current.driveSyncedAt = Date.now();
     persist(state.current);
     updateStorageLoc();
     refreshGoogleUI();
     toast("Saved to Google Drive", "success");
   } catch (e) {
     setSaveState("error");
-    toast(e.message || "Google Drive save failed", "error");
+    reportDriveError(e, "Google Drive save failed");
   }
 }
 
@@ -1468,6 +1801,7 @@ async function openDriveFile(f, parentId) {
       existing.driveName = f.name;
       existing.driveParentId = parentId || existing.driveParentId || null;
       existing.updated = Date.now();
+      existing.driveSyncedAt = existing.updated; // just read from Drive: in sync
       store.saveLibrary(state.library); // persist refreshed content immediately
       loadDoc(existing);
     } else {
@@ -1486,7 +1820,7 @@ async function openDriveFile(f, parentId) {
     }
     toast("Opened from Drive", "success");
   } catch (e) {
-    toast(e.message || "Could not open the file", "error");
+    reportDriveError(e, "Could not open the file");
   }
 }
 
@@ -1494,23 +1828,36 @@ function refreshGoogleUI() {
   const p = google.getProfile();
   // Treat a valid token as "connected" even if the profile fetch failed, so the
   // user can still reach the Drive menu / Sign out.
-  if (p || google.isSignedIn()) {
+  // A remembered account counts as connected even before a token is re-issued,
+  // so a page reload doesn't look like a sign-out. `is-stale` distinguishes
+  // "we know who you are but Drive needs a click" from a live session.
+  if (p) {
     googleBtn.classList.add("is-connected");
-    googleLabel.textContent = p ? (p.given_name || p.name || "Account").split(" ")[0] : "Account";
-    if (p?.picture) {
+    googleBtn.classList.toggle("is-stale", !google.isSignedIn());
+    googleLabel.textContent = (p.given_name || p.name || "Account").split(" ")[0];
+    if (p.picture) {
       googleAvatar.src = p.picture;
       googleAvatar.hidden = false;
     } else {
       googleAvatar.hidden = true;
     }
-    googleBtn.title = `${p?.email || "Signed in"} — click for Drive actions`;
+    setTip(
+      googleBtn,
+      google.isSignedIn()
+        ? `${p.email || "Signed in"} — click for Drive actions`
+        : `${p.email || "Signed in"} — reconnect to Google Drive`,
+    );
   } else {
+    googleBtn.classList.remove("is-stale");
     googleBtn.classList.remove("is-connected");
     googleLabel.textContent = "Sign in";
     googleAvatar.hidden = true;
-    googleBtn.title = google.isConfigured()
-      ? "Sign in with Google to sync to Drive"
-      : "Add a Google Client ID in Settings to enable Drive";
+    setTip(
+      googleBtn,
+      google.isConfigured()
+        ? "Sign in with Google to sync to Drive"
+        : "Add a Google Client ID in Settings to enable Drive",
+    );
   }
 }
 
@@ -1549,31 +1896,69 @@ function reloadForAccount() {
   const doc = state.library.find((d) => d.id === currentId) || state.library[0];
   if (doc) loadDoc(doc);
   else newDoc("Welcome.md", SAMPLE);
-  renderTree();
+  refreshViews();
 }
 
-/** Runs after every successful Google sign-in. */
-async function onSignedIn() {
-  const id = google.getAccountId();
-  refreshGoogleUI();
-  if (!id) return; // token but no profile — stay in the signed-out namespace
-  const anonLib = store.loadLibraryOf("anon");
-  setAccount(id);
-  if (store.loadLibrary().length === 0 && anonLib.length) {
-    // First sign-in on this browser: adopt the signed-out library so existing
-    // work follows the user into their account instead of seeming to vanish.
-    store.saveLibrary(anonLib.map((d) => ({ ...d })));
-    toast(`Added ${anonLib.length} document${anonLib.length === 1 ? "" : "s"} from this browser to your account`);
+/**
+ * Switch the app to `id`'s documents. Registered once with google.js, which
+ * calls it for every identity change — sign-in, a silent refresh that first
+ * learns the profile, sign-out. Routing it through google.js is what makes it
+ * impossible to obtain a token without the namespace following: doing that by
+ * hand at each call site meant "Save to Drive" quietly authenticated while
+ * leaving every document in the shared signed-out bucket.
+ *
+ * @returns {string} a note to append to the caller's toast, if anything was
+ * adopted.
+ */
+// Set by switchAccount, consumed by whichever toast reports the sign-in. The
+// adoption message used to be its own toast and was overwritten milliseconds
+// later by "Signed in as …", so nobody ever saw it.
+let accountNote = "";
+
+function switchAccount(id) {
+  const target = id || "anon";
+  // A pure token refresh must not touch documents: re-running the full reload
+  // reset the editor from disk, discarding unsaved keystrokes and scrolling the
+  // user back to the top mid-session.
+  if (target === getAccount()) {
+    refreshGoogleUI();
+    return "";
+  }
+  flushSave();
+  let note = "";
+  if (id) {
+    const anonLib = store.loadLibraryOf("anon");
+    setAccount(id);
+    const settings = store.loadSettings();
+    // Adopt the signed-out library exactly once per account per browser. The old
+    // "is the account library empty?" test re-harvested it every time — so
+    // deleting everything and signing back in resurrected it.
+    if (!settings.adoptedAnon && anonLib.length) {
+      settings.adoptedAnon = true;
+      store.saveSettings(settings);
+      if (store.loadLibrary().length === 0) {
+        store.saveLibrary(anonLib.map((d) => ({ ...d })));
+        note = ` — added ${anonLib.length} document${anonLib.length === 1 ? "" : "s"} from this browser`;
+      }
+    }
+  } else {
+    setAccount(null);
   }
   reloadForAccount();
   refreshGoogleUI();
+  accountNote = note;
+  return note;
 }
+google.onAccountChange(switchAccount);
 
 /** Sign in (if needed) and switch to that account's documents. */
 async function ensureSignedIn() {
   if (google.isSignedIn() && google.getAccountId()) return true;
-  await google.signIn();
-  await onSignedIn();
+  // A known account only needs a token, and that can be had silently — no
+  // popup, which matters because most callers run after the click that
+  // triggered them (a drop, a retry) and a popup would be blocked.
+  if (google.hasSession() && (await google.resumeSession())) return true;
+  await google.signIn(); // fires switchAccount via google.onAccountChange
   return true;
 }
 
@@ -1604,6 +1989,7 @@ async function syncLocalDocsToDrive() {
         doc.driveId = res.id;
         doc.driveName = res.name || doc.name;
         doc.driveParentId = (res.parents && res.parents[0]) || root.id;
+        doc.driveSyncedAt = Date.now();
         ok++;
       } catch {
         /* one bad file shouldn't abort the rest; the count reports the truth */
@@ -1611,7 +1997,7 @@ async function syncLocalDocsToDrive() {
     }
     store.saveLibrary(state.library);
     state.driveCache = {};
-    renderTree();
+    refreshViews();
     setSaveState(ok === pending.length ? "saved" : "error");
     toast(
       `Synced ${ok} of ${pending.length} document${pending.length === 1 ? "" : "s"} to Drive`,
@@ -1639,7 +2025,13 @@ function toggleGoogleMenu() {
   menuEl.style.top = rect.bottom + 6 + "px";
   menuEl.style.left = Math.max(8, rect.right - 200) + "px";
   const localOnly = state.library.filter((d) => !d.driveId).length;
-  const actions = [
+  const actions = [];
+  // When the session has lapsed the only useful action is getting it back, and
+  // it needs a real click — a silent refresh has already been tried and failed.
+  if (!google.isSignedIn()) {
+    actions.push(["Reconnect to Google Drive", reconnectGoogle]);
+  }
+  actions.push(
     ["Save current doc to Drive", () => saveToDrive()],
     [
       localOnly
@@ -1651,7 +2043,7 @@ function toggleGoogleMenu() {
       if (!isExpanded(DRIVE_ROOT_KEY)) toggleDriveRoot();
     }],
     ["Sign out", doSignOut],
-  ];
+  );
   for (const [label, fn] of actions) {
     const b = document.createElement("button");
     b.className = "ghost-btn";
@@ -1683,41 +2075,89 @@ async function onGoogleButton() {
     toast("Add your Google Client ID to enable Drive.");
     return;
   }
-  if (google.getProfile() || google.isSignedIn()) {
+  if (google.hasSession()) {
     toggleGoogleMenu();
     return;
   }
+  await signInInteractively();
+}
+
+/** The one place an interactive sign-in is started, straight from a click. */
+async function signInInteractively() {
   try {
+    // switchAccount runs from google.onAccountChange, so the namespace has
+    // already followed by the time this resolves; it returns any adoption note.
     await google.signIn();
-    await onSignedIn(); // switch to this account's documents
     const p = google.getProfile();
-    toast(p?.email ? `Signed in as ${p.email}` : "Signed in to Google", "success");
+    toast((p?.email ? `Signed in as ${p.email}` : "Signed in to Google") + accountNote, "success");
+    accountNote = "";
+    return true;
   } catch (e) {
+    refreshGoogleUI();
     toast(e.message || "Google sign-in failed", "error");
+    return false;
   }
+}
+
+async function reconnectGoogle() {
+  if (await signInInteractively()) refreshGoogleUI();
 }
 
 function doSignOut() {
-  google.signOut();
-  setAccount(null); // back to this browser's signed-out library
-  reloadForAccount();
-  refreshGoogleUI();
+  google.signOut(); // fires switchAccount(null)
   toast("Signed out — showing this browser's documents");
 }
 
-/* ------------------------------------------------------------------ editor formatting */
+/* ------------------------------------------------------------------ editor formatting
+ * Every mutation goes through replaceRange(), which uses execCommand
+ * ("insertText"). setRangeText() is the modern API but it writes outside the
+ * textarea's own undo transaction, so a single toolbar click or Tab press wiped
+ * the entire native undo stack — Ctrl+Z then did nothing, not even for the plain
+ * typing that came before. execCommand is deprecated but remains the only way to
+ * edit a textarea and keep undo working in Chrome, Safari and Firefox.
+ */
+function replaceRange(text, start, end, selStart, selEnd) {
+  editor.focus();
+  editor.setSelectionRange(start, end);
+  let inserted = false;
+  try {
+    inserted = document.execCommand("insertText", false, text);
+  } catch {
+    inserted = false;
+  }
+  if (!inserted) editor.setRangeText(text, start, end, "end"); // fallback: no undo
+  editor.setSelectionRange(selStart ?? start + text.length, selEnd ?? start + text.length);
+  onEdit();
+}
+
 function surround(before, after = before, placeholder = "") {
   const start = editor.selectionStart;
   const end = editor.selectionEnd;
-  const sel = editor.value.slice(start, end) || placeholder;
-  const text = before + sel + after;
-  editor.setRangeText(text, start, end, "end");
-  if (!editor.value.slice(start, end)) {
-    // reposition inside for empty selection
-    editor.selectionStart = editor.selectionEnd = start + before.length + sel.length;
+  const value = editor.value;
+  const hadSelection = end > start;
+  const sel = hadSelection ? value.slice(start, end) : placeholder;
+
+  // A second press removes the markers instead of nesting them: pressing Bold
+  // twice used to leave `**hello****bold text**`.
+  if (hadSelection && sel.startsWith(before) && sel.endsWith(after) && sel.length >= before.length + after.length) {
+    const inner = sel.slice(before.length, sel.length - after.length);
+    return replaceRange(inner, start, end, start, start + inner.length);
   }
-  editor.focus();
-  onEdit();
+  if (
+    value.slice(Math.max(0, start - before.length), start) === before &&
+    value.slice(end, end + after.length) === after
+  ) {
+    const s = start - before.length;
+    return replaceRange(sel, s, end + after.length, s, s + sel.length);
+  }
+
+  const text = before + sel + after;
+  // With no selection, leave the placeholder SELECTED so the next keystroke
+  // overtypes it. It used to be left with a collapsed caret inside, so typing
+  // produced `**bold texthello**`.
+  const selStart = start + before.length;
+  const selEnd = selStart + sel.length;
+  replaceRange(text, start, end, hadSelection ? selStart : selStart, hadSelection ? selEnd : selEnd);
 }
 
 function prefixLines(prefix) {
@@ -1725,23 +2165,36 @@ function prefixLines(prefix) {
   const end = editor.selectionEnd;
   const value = editor.value;
   const lineStart = value.lastIndexOf("\n", start - 1) + 1;
-  const block = value.slice(lineStart, end);
-  const replaced = block
-    .split("\n")
-    .map((l, i) => (typeof prefix === "function" ? prefix(l, i) : prefix + l))
+  // A selection that ends exactly at a line start does NOT include that line.
+  // Slicing to `end` kept the trailing "\n", so the split produced an extra
+  // empty entry that got prefixed and merged into the following line — which is
+  // how "select two lines, make a numbered list" renumbered a third one.
+  const blockEnd = end > lineStart && value[end - 1] === "\n" ? end - 1 : end;
+  const block = value.slice(lineStart, blockEnd);
+  const lines = block.split("\n");
+  const plain = typeof prefix !== "function";
+  // Pressing the same button again removes the prefix rather than stacking it
+  // ("# # heading").
+  const allPrefixed = plain && lines.every((l) => l.startsWith(prefix));
+  const replaced = lines
+    .map((l, i) => (allPrefixed ? l.slice(prefix.length) : typeof prefix === "function" ? prefix(l, i) : prefix + l))
     .join("\n");
-  editor.setRangeText(replaced, lineStart, end, "end");
-  editor.focus();
-  onEdit();
+  // Keep the lines selected so actions can be chained (bullet, then quote).
+  replaceRange(replaced, lineStart, blockEnd, lineStart, lineStart + replaced.length);
 }
 
-function insertBlock(text) {
+/**
+ * @param {string} text
+ * @param {number} [caret] offset within `text` to leave the caret at — used so
+ *   the code-block template drops you between the fences rather than after them.
+ */
+function insertBlock(text, caret) {
   const start = editor.selectionStart;
   const before = editor.value.slice(0, start);
   const pad = before && !before.endsWith("\n\n") ? (before.endsWith("\n") ? "\n" : "\n\n") : "";
-  editor.setRangeText(pad + text, start, editor.selectionEnd, "end");
-  editor.focus();
-  onEdit();
+  const full = pad + text;
+  const at = caret == null ? start + full.length : start + pad.length + caret;
+  replaceRange(full, start, editor.selectionEnd, at, at);
 }
 
 const FORMATTERS = {
@@ -1758,8 +2211,8 @@ const FORMATTERS = {
   link: () => surround("[", "](https://)", "link text"),
   image: () => insertBlock("![alt text](https://)"),
   table: () =>
-    insertBlock("| Column A | Column B |\n| -------- | -------- |\n| Cell 1   | Cell 2   |\n"),
-  codeblock: () => insertBlock("```js\n\n```"),
+    insertBlock("| Column A | Column B |\n| -------- | -------- |\n| Cell 1   | Cell 2   |\n", 2),
+  codeblock: () => insertBlock("```js\n\n```", 6),
   hr: () => insertBlock("---\n"),
 };
 
@@ -1953,7 +2406,8 @@ function handleDrop(e) {
   if (!e.dataTransfer?.files?.length) return;
   e.preventDefault();
   e.stopPropagation();
-  importFilesInto(e.dataTransfer.files, { source: "local", path: "" });
+  // openSingle: dropping one file on the editor is a request to edit it.
+  importFilesInto(e.dataTransfer.files, { source: "local", path: "" }, { openSingle: true });
 }
 
 async function handlePaste(e) {
@@ -1981,16 +2435,46 @@ function download(filename, text, type = "text/markdown") {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function standaloneHtml() {
+/**
+ * The rendered markup depends on more than github-markdown-css: highlight.js
+ * supplies the code colours, and this app's own stylesheet hides the heading
+ * permalinks and styles alerts and diagrams. Without them the "self-contained
+ * styled page" came out with no syntax highlighting, a stray blue `#` before
+ * every heading, and `> [!NOTE]` callouts as grey blockquotes.
+ */
+function standaloneHtml(html) {
   const title = escapeHtml(state.current?.name || "Document");
+  const theme = state.dark ? "dark" : "light";
+  const hljsTheme = state.dark ? "github-dark" : "github";
   return `<!doctype html>
-<html><head><meta charset="utf-8"><title>${title}</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown-${
-    state.dark ? "dark" : "light"
-  }.min.css">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown-${theme}.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<style>body{margin:0;background:${state.dark ? "#0d1117" : "#fff"}}.markdown-body{max-width:900px;margin:0 auto;padding:40px 24px}</style>
-</head><body><article class="markdown-body">${preview.innerHTML}</article></body></html>`;
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/styles/${hljsTheme}.min.css">
+<style>
+body{margin:0;background:${state.dark ? "#0d1117" : "#fff"}}
+.markdown-body{max-width:900px;margin:0 auto;padding:40px 24px}
+.markdown-body .anchor-link{display:none}
+.markdown-body .md-alert{border-left:.25em solid var(--al,#4493f8);padding:.5rem 1rem;margin:1rem 0}
+.markdown-body .md-alert.tip{--al:#3fb950}.markdown-body .md-alert.important{--al:#ab7df8}
+.markdown-body .md-alert.warning{--al:#d29922}.markdown-body .md-alert.caution{--al:#f85149}
+.markdown-body .md-alert-title{margin:0 0 .25rem;font-weight:600;text-transform:capitalize;color:var(--al,#4493f8)}
+.markdown-body .mermaid-figure{display:block;overflow-x:auto;text-align:center;margin:1rem 0}
+.markdown-body .mermaid-figure svg{max-width:none;height:auto}
+.markdown-body img{max-width:100%}
+</style>
+</head><body><article class="markdown-body">${html ?? preview.innerHTML}</article></body></html>`;
+}
+
+/**
+ * The HTML to export. Renders straight from the source rather than scraping the
+ * preview, so a pending 180ms render debounce can't ship the previous version —
+ * and so a blank document doesn't export the app's own "This document is blank"
+ * placeholder as if it were content.
+ */
+function exportableHtml() {
+  return editor.value.trim() ? renderMarkdown(editor.value) : "";
 }
 
 function docBaseName() {
@@ -2023,21 +2507,53 @@ function setPrintLight(on) {
 
 async function printPreview() {
   closeModals();
+  // The Files view hides the preview and is itself not excluded from print, so
+  // printing with it open produced a PDF of the file table.
+  closeFiles();
   // Make sure the preview reflects the latest keystrokes before the dialog opens.
   clearTimeout(state.renderTimer);
   await renderNow();
+  // Mermaid bakes its palette into the SVG, so swapping the <link> stylesheets
+  // isn't enough: a dark-theme diagram printed as black boxes joined by
+  // near-invisible pale arrows. Re-render it for paper, then put it back.
+  // (A second enhance() alone can't do it: the mermaid source block has already
+  // been replaced by its figure, so the whole preview has to be re-rendered.)
+  const wasDark = state.dark;
+  if (wasDark) {
+    setPrintLight(true);
+    state.dark = false;
+    await renderNow();
+  }
   window.print();
+  if (wasDark) {
+    state.dark = true;
+    setPrintLight(false);
+    await renderNow();
+  }
 }
 
 function doExport(kind) {
   closeModals();
   const name = docBaseName();
+  if (kind === "print") return printPreview();
+  const html = exportableHtml();
+  if (kind !== "md" && !html) {
+    toast("This document is blank — nothing to export", "error");
+    return;
+  }
   if (kind === "md") downloadMd();
-  else if (kind === "html") download(name + ".html", standaloneHtml(), "text/html");
+  else if (kind === "html") download(name + ".html", standaloneHtml(html), "text/html");
   else if (kind === "copy-html")
-    navigator.clipboard.writeText(preview.innerHTML).then(() => toast("Rendered HTML copied", "success"));
-  else if (kind === "print") printPreview();
+    navigator.clipboard.writeText(html).then(
+      () => toast("Rendered HTML copied", "success"),
+      () => toast("Could not copy to the clipboard", "error"),
+    );
 }
+
+// Above this, a link is long enough to break in mail clients and chat apps —
+// which is easy to reach, because a pasted image is embedded as a base64 data
+// URI and LZString cannot compress base64.
+const SHARE_URL_WARN = 30_000;
 
 function shareLink() {
   try {
@@ -2045,6 +2561,11 @@ function shareLink() {
       JSON.stringify({ n: state.current?.name || "Shared.md", t: editor.value }),
     );
     const url = `${location.origin}${location.pathname}#s=${payload}`;
+    const huge = url.length > SHARE_URL_WARN;
+    if (huge && !confirm(
+      `This link is ${Math.round(url.length / 1024)} KB long (embedded images make it big) and many apps will ` +
+        `truncate it. Copy it anyway?\n\nExporting HTML or saving to Drive is more reliable.`,
+    )) return;
     navigator.clipboard.writeText(url).then(
       () => toast("Shareable link copied to clipboard", "success"),
       () => prompt("Copy this link:", url),
@@ -2057,39 +2578,67 @@ function shareLink() {
 function tryLoadShared() {
   const m = location.hash.match(/[#&]s=([^&]+)/);
   if (!m) return false;
+  // Keep the query string; only the hash is ours to clear.
+  const clean = () => history.replaceState(null, "", location.pathname + location.search);
   try {
     const data = JSON.parse(LZString.decompressFromEncodedURIComponent(m[1]));
-    history.replaceState(null, "", location.pathname);
+    clean();
     newDoc(data.n || "Shared.md", data.t || "");
     toast("Loaded a shared document", "success");
     return true;
   } catch {
+    // A link truncated by a mail client used to fail in total silence, leaving
+    // the broken hash in the URL so a reload failed the same way.
+    clean();
+    toast("That shared link is damaged or incomplete", "error");
     return false;
   }
 }
 
 /* ------------------------------------------------------------------ modals */
+// These dialogs declare aria-modal, so the rest of the page must actually be
+// unreachable while one is open — it wasn't: focus stayed on the trigger, one
+// Tab moved behind the backdrop into invisible header buttons, and closing left
+// focus wherever it had wandered.
+let modalOpener = null;
 function openModal(id) {
+  modalOpener = document.activeElement;
   $("modal-backdrop").hidden = false;
-  $(id).hidden = false;
+  const modal = $(id);
+  modal.hidden = false;
   if (id === "settings-modal") {
-    $("set-client-id").value = state.settings.googleClientId || "";
+    // Show the ID actually in use. The field used to render empty whenever the
+    // ID came from config.js, so pressing Save stored "" and switched Drive off
+    // until the next reload.
+    $("set-client-id").value = state.settings.googleClientId || CONFIG.googleClientId || "";
   }
+  app.inert = true;
+  const first = modal.querySelector("input, textarea, select, button:not([data-close])");
+  (first || modal).focus?.();
 }
 function closeModals() {
   $("modal-backdrop").hidden = true;
   document.querySelectorAll(".modal").forEach((m) => (m.hidden = true));
   closeGoogleMenu();
+  app.inert = false;
+  modalOpener?.focus?.();
+  modalOpener = null;
 }
 
 function saveSettings() {
   const id = $("set-client-id").value.trim();
-  state.settings.googleClientId = id;
+  // Store an override only when it differs from what the deployment ships, so
+  // "save without editing" is a no-op and clearing the field means the same
+  // thing before and after a reload.
+  if (!id || id === (CONFIG.googleClientId || "")) delete state.settings.googleClientId;
+  else state.settings.googleClientId = id;
   store.saveSettings(state.settings);
-  google.configure(id, CONFIG.driveFolderName, CONFIG.legacyDriveFolderNames);
+  const active = state.settings.googleClientId || CONFIG.googleClientId || "";
+  google.configure(active, CONFIG.driveFolderName, CONFIG.legacyDriveFolderNames);
+  google.preload();
   refreshGoogleUI();
   closeModals();
-  toast("Settings saved", "success");
+  toast(active ? "Settings saved" : "Settings saved — Google Drive is off", "success");
 }
 
 /* ------------------------------------------------------------------ divider resize */
@@ -2112,9 +2661,14 @@ function setupDivider() {
     const sidebar = app.classList.contains("sidebar-collapsed") ? 0 : $("sidebar").offsetWidth;
     // flex-basis % is relative to the full workspace width, so the ratio must be
     // too — otherwise the divider drifts ahead of the cursor when the sidebar
-    // is open (the default).
+    // is open (the default). The 15/85% guard rails, however, have to be applied
+    // to the space the two panes actually share: measured against the full
+    // width they let the editor take 100% (collapsing the preview to zero, which
+    // then persisted) while over-clamping the other end.
+    const avail = Math.max(1, ws.width - sidebar);
     const w = e.clientX - ws.left - sidebar;
-    const clamped = Math.min(0.85, Math.max(0.15, w / ws.width));
+    const share = Math.min(0.85, Math.max(0.15, w / avail));
+    const clamped = (share * avail) / ws.width;
     applyRatio(clamped);
     state.settings.splitRatio = clamped;
   });
@@ -2164,19 +2718,30 @@ function setupFastTooltips() {
   tipEl.setAttribute("role", "tooltip");
   document.body.appendChild(tipEl);
   const els = document.querySelectorAll(
-    "#sidebar-toggle[title], .toolbar [title], .header-actions .icon-btn[title]," +
-      " .side-actions [title], .statusbar .link-btn[title]",
+    "#sidebar-toggle[title], .toolbar [title], .header-actions [title]," +
+      " .side-actions [title], .statusbar .link-btn[title], .pane-divider[title]",
   );
   els.forEach((el) => {
     const t = el.getAttribute("title");
     if (!t) return;
-    el.dataset.tip = t;
-    if (!el.hasAttribute("aria-label")) el.setAttribute("aria-label", t);
-    el.removeAttribute("title"); // suppress the slow native tooltip
+    setTip(el, t);
     el.addEventListener("mouseenter", showTip);
     el.addEventListener("mouseleave", hideTip);
     el.addEventListener("mousedown", hideTip);
   });
+  tipsReady = true;
+}
+let tipsReady = false;
+/**
+ * Point an element at the fast tooltip instead of the slow native one, keeping
+ * its accessible name. Used for controls whose label changes at runtime (the
+ * account button), which otherwise reverted to the native `title`.
+ */
+function setTip(el, text) {
+  if (!el) return;
+  el.dataset.tip = text;
+  el.setAttribute("aria-label", text);
+  el.removeAttribute("title");
 }
 
 /* ------------------------------------------------------------------ wiring */
@@ -2193,21 +2758,47 @@ function wireEvents() {
 
   // Tab: insert two spaces at a caret; indent/outdent whole lines for a
   // selection (Shift+Tab outdents).
+  //
+  // Capturing Tab unconditionally made the editor a keyboard trap (WCAG 2.1.2):
+  // a keyboard-only user who reached the textarea could never leave it. Escape
+  // now releases Tab for one press, which is the established pattern for
+  // editors that consume it.
+  let tabEscapes = false;
   editor.addEventListener("keydown", (e) => {
-    if (e.key === "Tab" && !e.metaKey && !e.ctrlKey) {
-      e.preventDefault();
-      const { selectionStart: s, selectionEnd: en, value } = editor;
-      if (s === en && !e.shiftKey) {
-        editor.setRangeText("  ", s, en, "end");
-      } else {
-        const lineStart = value.lastIndexOf("\n", s - 1) + 1;
-        const block = value.slice(lineStart, en);
-        const next = e.shiftKey
-          ? block.split("\n").map((l) => l.replace(/^ {1,2}/, "")).join("\n")
-          : block.split("\n").map((l) => "  " + l).join("\n");
-        editor.setRangeText(next, lineStart, en, "select");
-      }
-      onEdit();
+    if (e.key === "Escape") {
+      tabEscapes = true;
+      return;
+    }
+    if (e.key !== "Tab") {
+      tabEscapes = false;
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (tabEscapes) {
+      tabEscapes = false;
+      return; // let the browser move focus out
+    }
+    e.preventDefault();
+    const { selectionStart: s, selectionEnd: en, value } = editor;
+    if (s === en && !e.shiftKey) {
+      replaceRange("  ", s, en);
+      return;
+    }
+    const lineStart = value.lastIndexOf("\n", s - 1) + 1;
+    const blockEnd = en > lineStart && value[en - 1] === "\n" ? en - 1 : en;
+    const block = value.slice(lineStart, blockEnd);
+    const next = e.shiftKey
+      ? block.split("\n").map((l) => l.replace(/^ {1,2}/, "")).join("\n")
+      : block.split("\n").map((l) => "  " + l).join("\n");
+    // Outdenting lines that have no indentation is a no-op — it used to mark the
+    // document Unsaved and schedule a pointless write.
+    if (next === block) return;
+    if (s === en) {
+      // Collapsed caret: keep it collapsed, shifted by what changed on its line.
+      const delta = next.length - block.length;
+      replaceRange(next, lineStart, blockEnd, Math.max(lineStart, s + delta), Math.max(lineStart, s + delta));
+    } else {
+      replaceRange(next, lineStart, blockEnd, lineStart, lineStart + next.length);
     }
   });
 
@@ -2224,12 +2815,19 @@ function wireEvents() {
         state.current.name = finalName;
         state.current.driveName = finalName;
         docTitle.value = finalName;
+        // Keep the cached Drive listing in step. It used to keep the old name,
+        // so the sidebar showed the stale row — and clicking it reopened the
+        // file and wrote the old name back over the rename.
+        const cached = state.driveCache[state.current.driveParentId]?.files?.find(
+          (x) => x.id === state.current.driveId,
+        );
+        if (cached) cached.name = finalName;
         toast("Renamed on Drive", "success");
       } catch (e) {
-        toast(e.message || "Could not rename on Drive", "error");
+        reportDriveError(e, "Could not rename on Drive");
       }
     }
-    persist(state.current);
+    persist(state.current, { touch: false });
     updateStorageLoc();
   });
 
@@ -2264,7 +2862,9 @@ function wireEvents() {
     filesView.classList.add("drop-active");
   });
   filesView.addEventListener("dragleave", (e) => {
-    if (e.target === filesView) filesView.classList.remove("drop-active");
+    // dragover bubbles from the rows, but the matching dragleave fires ON the
+    // row — so an `e.target === filesView` test never cleared the highlight.
+    if (!filesView.contains(e.relatedTarget)) filesView.classList.remove("drop-active");
   });
   filesView.addEventListener("drop", async (e) => {
     if (!e.dataTransfer?.files?.length) return;
@@ -2272,6 +2872,7 @@ function wireEvents() {
     filesView.classList.remove("drop-active");
     await importFilesInto(e.dataTransfer.files, filesDropTarget());
   });
+  document.addEventListener("dragend", clearDropHighlights);
 
   // A file dropped outside a drop zone would otherwise make the browser
   // navigate away from the app (losing unsaved work). Swallow those.
@@ -2280,6 +2881,8 @@ function wireEvents() {
       if (e.dataTransfer?.types?.includes("Files")) e.preventDefault();
     });
   }
+  // The heading label is a real <button>, so sorting is reachable by keyboard
+  // and announced; the click still lands anywhere in the cell.
   document.querySelectorAll(".files-table th[data-sort]").forEach((th) =>
     th.addEventListener("click", () => {
       const col = th.dataset.sort;
@@ -2319,17 +2922,60 @@ function wireEvents() {
   window.addEventListener("keydown", onShortcut);
   // Editor width changes (window resize, divider drag) change line wrapping,
   // so the cached per-line offsets used for scroll sync must be rebuilt.
-  window.addEventListener("resize", invalidateLineOffsets);
+  window.addEventListener("resize", () => {
+    invalidateLineOffsets();
+    if (state.view === "split" && isNarrow()) setView("preview");
+  });
+
+  // Reloading or closing the tab within the 500ms autosave debounce used to
+  // discard that edit outright. `pagehide` is the reliable signal (mobile
+  // browsers throttle `beforeunload`); `visibilitychange` covers app-switching.
+  window.addEventListener("pagehide", flushSave);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushSave();
+  });
+
+  // Task-list checkboxes render as real, clickable inputs, but nothing was
+  // listening: the tick reverted on the next render and the Markdown never
+  // changed. Each list item now carries its own data-source-line, so the source
+  // can be rewritten exactly.
+  preview.addEventListener("change", (e) => {
+    const box = e.target;
+    if (!box.matches?.('input[type="checkbox"]')) return;
+    const li = box.closest("[data-source-line]");
+    const line = Number(li?.getAttribute("data-source-line"));
+    if (!Number.isFinite(line)) return;
+    const lines = editor.value.split("\n");
+    const src = lines[line];
+    if (src == null || !/^\s*[-*+]\s+\[[ xX]\]/.test(src)) return;
+    lines[line] = src.replace(/\[[ xX]\]/, box.checked ? "[x]" : "[ ]");
+    editor.value = lines.join("\n");
+    onEdit();
+  });
 }
 
 function onShortcut(e) {
   const mod = e.metaKey || e.ctrlKey;
   if (e.key === "Escape") {
-    if (app.classList.contains("files-open")) closeFiles();
-    return closeModals();
+    // Dismiss the topmost transient layer only. Escape used to close the whole
+    // Files view while leaving an open row menu floating over the editor — still
+    // live, so its Rename item still renamed things.
+    if (ctxEl) return closeContextMenu();
+    if (menuEl) return closeGoogleMenu();
+    if (document.querySelector(".modal:not([hidden])")) return closeModals();
+    if (app.classList.contains("files-open")) return closeFiles();
+    return;
   }
   if (!mod) return;
+  // Text-editing shortcuts must not reach the document while the user is typing
+  // in a field: Ctrl+B during a rename injected "**bold text**" into the
+  // document body and yanked focus to the editor mid-word.
+  const t = e.target;
+  const inField =
+    t && t !== editor && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.isContentEditable);
+  const modalOpen = !!document.querySelector(".modal:not([hidden])");
   const k = e.key.toLowerCase();
+  if ((inField || modalOpen) && k !== "s") return;
   const map = {
     s: () => (e.shiftKey ? saveToDrive() : quickSave()),
     b: () => FORMATTERS.bold(),
@@ -2351,13 +2997,29 @@ function onShortcut(e) {
 }
 
 function quickSave() {
-  if (state.current) persist(state.current);
-  if (google.isConfigured() && (state.current?.driveId || google.isSignedIn())) saveToDrive();
-  else toast("Saved to this browser (autosave is on)", "success");
+  const ok = state.current ? persist(state.current) : true;
+  if (!ok) return; // persist() already said what went wrong
+  // Only push to Drive when there is actually a session. Keying off the
+  // document's driveId alone meant a plain Ctrl+S could throw up a Google
+  // consent popup the user never asked for.
+  if (google.isConfigured() && google.hasSession() && (state.current?.driveId || google.isSignedIn())) {
+    saveToDrive();
+  } else if (state.current?.driveId) {
+    toast("Saved to this browser — sign in to update the Drive copy", "success");
+  } else {
+    toast("Saved to this browser (autosave is on)", "success");
+  }
 }
 
 /* ------------------------------------------------------------------ init */
 function init() {
+  // Adopt the remembered Google account BEFORE reading any documents, so a
+  // reload shows the right library on the first paint instead of flashing the
+  // signed-out one — which used to read as "logged out again", and worse, put
+  // anything typed afterwards into the shared signed-out bucket.
+  const restoredAccount = google.restoreSession();
+  if (restoredAccount) setAccount(restoredAccount);
+
   state.settings = store.loadSettings();
   state.library = store.loadLibrary();
   // Documents predating size/date tracking get a created stamp so the file
@@ -2388,18 +3050,34 @@ function init() {
     $("sidebar-toggle").setAttribute("aria-expanded", "false");
   }
 
-  // google
-  const clientId = state.settings.googleClientId || CONFIG.googleClientId || "";
+  // google. The Client ID override may have been typed while signed out, so fall
+  // back to the signed-out namespace's settings before config.js.
+  const clientId =
+    state.settings.googleClientId ||
+    store.loadSettingsOf("anon").googleClientId ||
+    CONFIG.googleClientId ||
+    "";
   google.configure(clientId, CONFIG.driveFolderName, CONFIG.legacyDriveFolderNames);
   refreshGoogleUI();
+  // Fetch the Google library now, not during the click that needs it: an
+  // interactive popup opened after a cross-origin script fetch is blocked by
+  // Safari and unreliable in Chrome.
+  google.preload();
+  // Renew the token in the background. Nothing blocks on it — the documents are
+  // already on screen — it just means Drive works without a click.
+  google.resumeSession().then((ok) => {
+    refreshGoogleUI();
+    if (ok && isExpanded(DRIVE_ROOT_KEY)) loadDriveFolder(state.driveRootId, { force: true });
+  });
 
   wireEvents();
   setupDivider();
   setupFastTooltips();
 
   // Signal the HTML fallback watchdog that the module graph loaded and the app
-  // booted (see the inline script in index.html).
+  // booted (see the inline script in index.html), and hand the editor over.
   window.__mdsReady = true;
+  editor.disabled = false;
 
   // Choose the document to show: shared link → last open → newest → sample.
   if (tryLoadShared()) return;

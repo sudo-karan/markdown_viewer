@@ -91,15 +91,21 @@ export const store = {
   loadLibrary() {
     return safeParse(lsGet(key(BASE_LIB)), []);
   },
+  /**
+   * @returns {boolean} false when the write was refused (private mode, or the
+   * quota is full — easy to hit, since pasted images are embedded as data URIs).
+   * Callers MUST surface a failure: reporting "Saved" for a write that never
+   * happened loses the user's work silently.
+   */
   saveLibrary(lib) {
-    lsSet(key(BASE_LIB), JSON.stringify(lib));
+    return lsSet(key(BASE_LIB), JSON.stringify(lib));
   },
 
   loadSettings() {
     return safeParse(lsGet(key(BASE_SETTINGS)), {});
   },
   saveSettings(s) {
-    lsSet(key(BASE_SETTINGS), JSON.stringify(s));
+    return lsSet(key(BASE_SETTINGS), JSON.stringify(s));
   },
 
   getCurrentId() {
@@ -113,6 +119,10 @@ export const store = {
   /** Read another namespace's library without switching to it. */
   loadLibraryOf(accountId) {
     return safeParse(lsGet(key(BASE_LIB, accountId || ANON)), []);
+  },
+  /** Same, for settings — used to find a Client ID typed before signing in. */
+  loadSettingsOf(accountId) {
+    return safeParse(lsGet(key(BASE_SETTINGS, accountId || ANON)), {});
   },
 };
 
