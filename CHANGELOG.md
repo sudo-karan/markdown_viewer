@@ -1,5 +1,23 @@
 # Changelog
 
+## [v0.23.3](https://github.com/sudo-karan/markdown_viewer/compare/v0.23.2...v0.23.3) - 2026-09-08
+### Other Changes
+- Unified local + Drive folder-tree sidebar with in-place save/rename by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/5
+- Retry GitHub Pages deploy once on transient publish failure by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/7
+- Editor UX: collapsible sidebar, blank-file notice, real scroll sync, Mermaid text, PDF/Download, instant tooltips by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/8
+- Editor UX: accurate wrap-aware scroll sync, click-to-source for code/diagrams, legible PDF, cache-busting by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/9
+- Mermaid: make label text contrast with custom node fills by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/10
+- Accounts via Google sign-in, per-account isolation, and a Files details view by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/11
+- Fix blank Mermaid diagrams (esm.sh rebuild), and allow importing/dragging files across sources by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/12
+- Make the app usable on a phone; rename the Drive folder safely by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/13
+- Fix the bugs a full tester sweep turned up across Markdown Studio by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/14
+- Set the deployment's Google OAuth Client ID by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/15
+- Fix the regressions and remaining findings from the adversarial audit by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/17
+- Finish the audit findings that missed the #17 merge by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/18
+- Close the two gaps left open after the audit by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/19
+- Fix what the third sweep reproduced by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/20
+- Retry the Pages artifact upload once by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/21
+
 ## [v0.23.2](https://github.com/sudo-karan/markdown_viewer/commits/v0.23.2) - 2026-07-05
 ### Other Changes
 - Add Markdown Studio: a static, GitHub Pages-hostable Markdown editor by @sudo-karan in https://github.com/sudo-karan/markdown_viewer/pull/1
