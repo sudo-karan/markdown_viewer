@@ -456,9 +456,17 @@ function openContextMenu(x, y, items) {
     });
     ctxEl.appendChild(b);
   }
-  ctxEl.style.left = Math.min(x, window.innerWidth - 170) + "px";
-  ctxEl.style.top = Math.min(y, window.innerHeight - 40 - items.length * 30) + "px";
+  // Position after measuring: the "Move to…" picker's length is unknown up
+  // front, and guessing 30px per row pushed a long menu off the top.
+  ctxEl.style.left = "0px";
+  ctxEl.style.top = "0px";
+  ctxEl.style.visibility = "hidden";
   document.body.appendChild(ctxEl);
+  const w = ctxEl.offsetWidth;
+  const h = ctxEl.offsetHeight;
+  ctxEl.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + "px";
+  ctxEl.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
+  ctxEl.style.visibility = "";
   setTimeout(() => document.addEventListener("click", onCtxOutside, true), 0);
 }
 
@@ -507,12 +515,12 @@ function makeRow(o) {
     kb.addEventListener("click", (e) => {
       e.stopPropagation();
       const r = kb.getBoundingClientRect();
-      openContextMenu(r.left, r.bottom + 2, o.menu());
+      openContextMenu(r.left, r.bottom + 2, o.menu(kb));
     });
     row.appendChild(kb);
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      openContextMenu(e.clientX, e.clientY, o.menu());
+      openContextMenu(e.clientX, e.clientY, o.menu(row));
     });
   }
 
@@ -699,8 +707,9 @@ function renderLocalFolder(node, depth) {
         if (doc.id !== state.current?.id) loadDoc(doc);
       },
       dragData: { source: "local", id: doc.id, name: doc.name },
-      menu: () => [
+      menu: (el) => [
         ["Rename", () => renameLocalDoc(doc)],
+        ["Move to…", () => openMoveMenu({ source: "local", id: doc.id, name: doc.name }, el)],
         ["Delete", () => deleteDoc(doc), "danger"],
       ],
     });
@@ -740,8 +749,9 @@ function renderDriveChildren(folderId, depth) {
       active: !!state.current?.driveId && state.current.driveId === f.id,
       onActivate: () => openDriveFile(f, folderId),
       dragData: { source: "drive", id: f.id, parentId: folderId, name: f.name },
-      menu: () => [
+      menu: (el) => [
         ["Rename", () => renameDriveFile(f, folderId)],
+        ["Move or copy to…", () => openMoveMenu({ source: "drive", id: f.id, parentId: folderId, name: f.name }, el)],
         ["Delete", () => deleteDriveFile(f, folderId), "danger"],
       ],
     });
@@ -1084,6 +1094,49 @@ async function copyDriveFileToLocal(dragData, targetPath) {
   }
 }
 
+/**
+ * Every place a document can be moved to, as menu entries.
+ *
+ * Drag-and-drop is HTML5 DnD, which touch devices never fire and keyboards
+ * cannot reach — so on a phone there was no way at all to move a document
+ * between folders, and no way for a keyboard user either. This drives a
+ * "Move to…" menu that reaches the same handlers as a drop.
+ */
+function moveDestinations() {
+  const out = [{ label: "This browser", target: { source: "local", path: "" } }];
+  for (const path of [...localFolders()].sort()) {
+    const depth = path.split("/").length;
+    out.push({ label: "\u00a0\u00a0".repeat(depth) + path.split("/").pop(), target: { source: "local", path } });
+  }
+  if (google.isConfigured()) {
+    out.push({ label: "Google Drive", target: { source: "drive", folderId: state.driveRootId } });
+    // Only folders we have actually listed can be offered by name; the root is
+    // always available and resolves (or is created) on demand.
+    const walk = (id, depth) => {
+      for (const f of state.driveCache[id]?.folders || []) {
+        out.push({ label: "\u00a0\u00a0".repeat(depth) + f.name, target: { source: "drive", folderId: f.id } });
+        walk(f.id, depth + 1);
+      }
+    };
+    if (state.driveRootId) walk(state.driveRootId, 1);
+  }
+  return out;
+}
+
+/** Show the destination picker for `dragData`, anchored near `el`. */
+function openMoveMenu(dragData, el) {
+  const here =
+    dragData.source === "local"
+      ? (state.library.find((d) => d.id === dragData.id)?.folder || "")
+      : dragData.parentId;
+  const items = moveDestinations()
+    .filter((d) => (d.target.source === "local" ? d.target.path !== here : d.target.folderId !== here))
+    .map((d) => [d.label, () => dropOnto(dragData, d.target)]);
+  if (!items.length) return toast("There is nowhere else to move it yet — make a folder first");
+  const r = el.getBoundingClientRect();
+  openContextMenu(r.left, r.bottom + 2, items);
+}
+
 /** Route an in-app drag to the right handler, including across sources. */
 async function dropOnto(dragData, target) {
   if (!dragData || !target) return;
@@ -1290,19 +1343,66 @@ function cachedDriveSubtree(rootId) {
   return ids;
 }
 
+// A folder tree deep or wide enough to exceed this is not something we should
+// walk synchronously while the user waits; we fall back to the cache and say so.
+const SUBTREE_SCAN_LIMIT = 200;
+
+/**
+ * Read the whole subtree under `rootId` FROM DRIVE — every descendant folder and
+ * the ids of every file in them.
+ *
+ * The cache is not good enough here: it only holds folders the user happened to
+ * expand this session, so a document sitting in a never-opened subfolder was
+ * left bound to a file that was about to be trashed — invisible in both views,
+ * still labelled "Drive: …", with Ctrl+S writing into the trash.
+ *
+ * Must run BEFORE the trash call: trashed children stop being listed.
+ * @returns {Promise<{folders: string[], fileIds: Set<string>, complete: boolean}>}
+ */
+async function driveSubtree(rootId) {
+  const folders = [rootId];
+  const fileIds = new Set();
+  let complete = true;
+  for (let i = 0; i < folders.length; i++) {
+    if (folders.length > SUBTREE_SCAN_LIMIT) {
+      complete = false;
+      break;
+    }
+    const { folders: subs, files } = await google.drive.listChildren(folders[i]);
+    for (const file of files) fileIds.add(file.id);
+    for (const sub of subs) if (!folders.includes(sub.id)) folders.push(sub.id);
+  }
+  return { folders, fileIds, complete };
+}
+
 async function deleteDriveFolder(f, parentId) {
-  if (!confirm(`Move folder "${f.name}" and its contents to the Google Drive trash?`)) return;
+  let scan = null;
+  try {
+    scan = await driveSubtree(f.id);
+  } catch {
+    /* listing failed — fall back to what we already know */
+  }
+  const affected = scan
+    ? [...scan.fileIds].filter((id) => state.library.some((d) => d.driveId === id)).length
+    : 0;
+  // Say what is actually about to happen, now that we know.
+  const detail = scan
+    ? `${scan.fileIds.size} file${scan.fileIds.size === 1 ? "" : "s"}` +
+      (scan.folders.length > 1 ? ` in ${scan.folders.length} folders` : "") +
+      (affected ? `; ${affected} open here will be kept in this browser` : "")
+    : "its contents";
+  if (!confirm(`Move folder "${f.name}" and ${detail} to the Google Drive trash?`)) return;
   try {
     await google.drive.trash(f.id);
     const c = state.driveCache[parentId];
     if (c) c.folders = c.folders.filter((x) => x.id !== f.id);
-    // Documents that lived inside used to stay in the library — invisible in
-    // both views (they have a driveId, so the local tree skips them, and their
-    // Drive folder is gone), still open, still labelled "Drive: …", with Ctrl+S
-    // writing into a trashed file. Keep them, as browser-only copies.
-    const subtree = cachedDriveSubtree(f.id);
+    // Documents that lived inside must not stay bound to trashed files. Keep
+    // them, as browser-only copies.
+    const subtree = scan ? scan.folders : cachedDriveSubtree(f.id);
     for (const id of subtree) driveTombstones.add(id);
-    const fileIds = new Set(subtree.flatMap((id) => (state.driveCache[id]?.files || []).map((x) => x.id)));
+    const fileIds =
+      scan?.fileIds ||
+      new Set(subtree.flatMap((id) => (state.driveCache[id]?.files || []).map((x) => x.id)));
     let rescued = 0;
     for (const doc of state.library) {
       if (doc.driveId && fileIds.has(doc.driveId)) {
@@ -1317,11 +1417,11 @@ async function deleteDriveFolder(f, parentId) {
     for (const id of subtree) delete state.driveCache[id];
     if (state.current?.driveId === null) updateStorageLoc();
     refreshViews();
-    toast(
-      rescued
-        ? `Moved to Drive trash · kept ${rescued} document${rescued === 1 ? "" : "s"} in this browser`
-        : "Moved to Drive trash",
-    );
+    const kept = rescued
+      ? ` · kept ${rescued} document${rescued === 1 ? "" : "s"} in this browser`
+      : "";
+    const partial = scan && !scan.complete ? " · folder was too large to scan fully" : "";
+    toast("Moved to Drive trash" + kept + partial, partial ? "error" : "");
   } catch (e) {
     reportDriveError(e, "Could not delete");
   }
@@ -1463,8 +1563,9 @@ async function collectFileRows() {
           loadDoc(live);
           closeFiles();
         },
-        menu: () => [
+        menu: (el) => [
           ["Rename", () => renameLocalDoc(doc)],
+          ["Move to…", () => openMoveMenu({ source: "local", id: doc.id, name: doc.name }, el)],
           ["Delete", () => deleteDoc(doc), "danger"],
         ],
       });
@@ -1498,8 +1599,9 @@ async function collectFileRows() {
       size: f.size != null ? Number(f.size) : null,
       created: f.createdTime, modified: f.modifiedTime,
       open: async () => { await openDriveFile(f, folderId); closeFiles(); },
-      menu: () => [
+      menu: (el) => [
         ["Rename", () => renameDriveFile(f, folderId)],
+        ["Move or copy to…", () => openMoveMenu({ source: "drive", id: f.id, parentId: folderId, name: f.name }, el)],
         ["Delete", () => deleteDriveFile(f, folderId), "danger"],
       ],
     });
@@ -1667,7 +1769,7 @@ async function renderFiles() {
       kb.addEventListener("click", (e) => {
         e.stopPropagation();
         const box = kb.getBoundingClientRect();
-        openContextMenu(box.left, box.bottom + 2, r.menu());
+        openContextMenu(box.left, box.bottom + 2, r.menu(kb));
       });
       actions.appendChild(kb);
     }
