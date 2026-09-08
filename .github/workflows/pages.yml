@@ -34,7 +34,22 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
+      # The artifact backend occasionally answers FinalizeArtifact with a
+      # 403 from an intermediary, which fails the whole deploy and leaves the
+      # site on the previous build. Retry once, same as the publish step.
       - name: Upload docs/ artifact
+        id: upload
+        continue-on-error: true
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Wait before retrying upload
+        if: steps.upload.outcome == 'failure'
+        run: sleep 20
+
+      - name: Upload docs/ artifact (retry)
+        if: steps.upload.outcome == 'failure'
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
